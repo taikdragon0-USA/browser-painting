@@ -202,6 +202,69 @@ html[data-dw-lock] {
   z-index: 2147483647;
 }
 
+/* 选择方式切换(框选/套索) */
+#draw-root .dw-selmode-row { display: flex; gap: 5px; }
+#draw-root .dw-selmode-row button {
+  flex: 1;
+  padding: 4px 6px;
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  color: #333;
+}
+#draw-root .dw-selmode-row button:hover { background: #f6f6f6; }
+#draw-root .dw-selmode-row button.dw-active {
+  background: #e8f0ff;
+  border-color: #2f7bff;
+  color: #2f7bff;
+}
+
+/* 快捷键面板 */
+#draw-root #dw-shortcuts {
+  position: fixed;
+  top: 70px;
+  right: 16px;
+  width: 236px;
+  background: rgba(255, 255, 255, 0.98);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+  padding: 8px 10px 10px;
+  pointer-events: auto;
+  z-index: 2147483647;
+  font: 12px/1.6 system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  color: #333;
+}
+#draw-root .dw-shortcuts-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: #444;
+}
+#draw-root .dw-shortcuts-head button {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  color: #666;
+  padding: 0 6px;
+  border-radius: 4px;
+}
+#draw-root .dw-shortcuts-head button:hover { background: rgba(0, 0, 0, 0.08); }
+#draw-root #dw-shortcuts table { width: 100%; border-collapse: collapse; }
+#draw-root #dw-shortcuts td { padding: 2px 4px; font-size: 11px; }
+#draw-root #dw-shortcuts .dw-k {
+  font-weight: 600;
+  color: #2f7bff;
+  white-space: nowrap;
+  font-family: Consolas, Menlo, monospace;
+  padding-right: 10px;
+}
+
 /* 框选操作条 */
 #draw-root .dw-selbar {
   position: fixed;

@@ -24,6 +24,12 @@
   const MIN_DIST = 1.2;
   const MAX_HISTORY = 100;
   const SWATCHES = ['#ff3b30', '#ffa400', '#ffe10a', '#1fcecb', '#2f7bff', '#1c1c1c'];
+  const SHORTCUT_LIST = [
+    ['V', '框选(套索/矩形)'], ['B', '循环切换笔刷'], ['E', '橡皮'], ['T', '文字'],
+    ['L', '直线'], ['A', '箭头'], ['R', '矩形'], ['O', '椭圆'],
+    ['H', '隐藏 / 显示草稿'], ['Delete', '删除所选'], ['Ctrl+Z', '撤销'], ['Ctrl+S', '导出截图'],
+    ['[', '尺寸减小'], [']', '尺寸增大'], ['?', '快捷键面板'], ['Esc', '取消 / 退出'],
+  ];
   const MAX_CANVAS_AREA = 24 * 1024 * 1024;
   const MAX_CANVAS_DIM = 32767;
 
@@ -57,6 +63,7 @@
       tool: 'pen', opacity: 1,
       pressureExp: 0.7, pressureMin: 0.15,
       autoSave: true, showDrafts: true,
+      selectMode: 'lasso',
     },
     window.DW_CONFIG || {}
   );
@@ -161,6 +168,133 @@
       if (i && segIntersectsRect(pts[i - 1], pts[i], r)) return true;
     }
     return false;
+  }
+
+  // ── 区域裁剪几何(框选/套索共用) ──────────────────────────
+  function lerp(a, b, t) {
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+  }
+  function pointInPolygon(p, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+      if ((yi > p.y) !== (yj > p.y) && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+  function segSegIntersectT(a, b, c, d) {
+    const d1x = b.x - a.x, d1y = b.y - a.y;
+    const d2x = d.x - c.x, d2y = d.y - c.y;
+    const denom = d1x * d2y - d1y * d2x;
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((c.x - a.x) * d2y - (c.y - a.y) * d2x) / denom;
+    const u = ((c.x - a.x) * d1y - (c.y - a.y) * d1x) / denom;
+    if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+    return { t: t, u: u };
+  }
+  // 线段在矩形内的参数区间(Liang-Barsky)
+  function clipSegmentRectT(a, b, r) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    let t0 = 0, t1 = 1;
+    const p = [-dx, dx, -dy, dy];
+    const q = [a.x - r.x0, r.x1 - a.x, a.y - r.y0, r.y1 - a.y];
+    for (let i = 0; i < 4; i++) {
+      if (p[i] === 0) { if (q[i] < 0) return []; }
+      else {
+        const t = q[i] / p[i];
+        if (p[i] < 0) { if (t > t1) return []; if (t > t0) t0 = t; }
+        else { if (t < t0) return []; if (t < t1) t1 = t; }
+      }
+    }
+    if (t0 > t1) return [];
+    return [[t0, t1]];
+  }
+  // 线段在多边形内的参数区间(按边求交 + 中点判内)
+  function clipSegmentPolyT(a, b, poly) {
+    const ts = [];
+    for (let i = 0; i < poly.length; i++) {
+      const it = segSegIntersectT(a, b, poly[i], poly[(i + 1) % poly.length]);
+      if (it && it.t > 0 && it.t < 1) ts.push(it.t);
+    }
+    ts.sort((x, y) => x - y);
+    const uniq = [];
+    for (const t of ts) if (!uniq.length || Math.abs(t - uniq[uniq.length - 1]) > 1e-6) uniq.push(t);
+    const pts = [0, ...uniq, 1];
+    const ranges = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const m0 = pts[i], m1 = pts[i + 1];
+      if (m1 - m0 < 1e-6) continue;
+      if (pointInPolygon(lerp(a, b, (m0 + m1) / 2), poly)) ranges.push([m0, m1]);
+    }
+    const merged = [];
+    for (const r of ranges) {
+      if (merged.length && r[0] - merged[merged.length - 1][1] < 1e-6) merged[merged.length - 1][1] = r[1];
+      else merged.push(r.slice());
+    }
+    return merged;
+  }
+  function pointInRegion(p, region) {
+    return region.type === 'rect' ? pointInRect(p, region.r) : pointInPolygon(p, region.pts);
+  }
+  function clipSegmentRegionT(a, b, region) {
+    return region.type === 'rect' ? clipSegmentRectT(a, b, region.r) : clipSegmentPolyT(a, b, region.pts);
+  }
+  // 折线按区域切分为"区域内/区域外"的连续片段(带边界插值点)
+  function splitPolyline(points, region) {
+    if (!points.length) return { inside: [], outside: [] };
+    if (points.length === 1) {
+      return pointInRegion(points[0], region)
+        ? { inside: [points], outside: [] }
+        : { inside: [], outside: [points] };
+    }
+    const runsIn = [], runsOut = [];
+    let curRun = null, curType = null;
+    const emit = (type, pt) => {
+      if (curType !== type) {
+        if (curRun && curRun.length) (curType ? runsIn : runsOut).push(curRun);
+        curRun = [];
+        curType = type;
+      }
+      const last = curRun[curRun.length - 1];
+      if (!last || Math.abs(last.x - pt.x) + Math.abs(last.y - pt.y) > 0.01) curRun.push(pt);
+    };
+    const flush = () => {
+      if (curRun && curRun.length) (curType ? runsIn : runsOut).push(curRun);
+      curRun = null;
+      curType = null;
+    };
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i], b = points[i + 1];
+      const ranges = clipSegmentRegionT(a, b, region);
+      if (!ranges.length) {
+        emit(false, a);
+        continue;
+      }
+      let cursor = 0;
+      for (const [t0, t1] of ranges) {
+        if (t0 > cursor) emit(false, lerp(a, b, cursor));
+        emit(true, lerp(a, b, Math.max(cursor, t0)));
+        emit(true, lerp(a, b, t1));
+        cursor = t1;
+      }
+      if (cursor < 1) emit(false, lerp(a, b, cursor));
+    }
+    flush();
+    return { inside: runsIn, outside: runsOut };
+  }
+  // 一笔 → "选内片段" 与 "选外片段"
+  function fragmentsForStroke(stroke, region) {
+    const tool = stroke.tool || 'pen';
+    if (tool === 'text' || tool === 'rect' || tool === 'ellipse') {
+      const hit = strokeHitPoints(stroke).some((p) => pointInRegion(p, region));
+      const whole = Object.assign({}, stroke, { srcId: stroke.id, id: ++Input._uid, points: stroke.points.slice() });
+      return hit ? { inside: [whole], outside: [] } : { inside: [], outside: [whole] };
+    }
+    const sp = splitPolyline(stroke.points, region);
+    return {
+      inside: sp.inside.map((run) => Object.assign({}, stroke, { srcId: stroke.id, id: ++Input._uid, points: run })),
+      outside: sp.outside.map((run) => Object.assign({}, stroke, { srcId: stroke.id, id: ++Input._uid, points: run })),
+    };
   }
 
   // ── 坐标换算 ───────────────────────────────────────────────
@@ -749,7 +883,10 @@
     finishErase(eraserSt) {
       if (!eraserSt.points.length) { Renderer.presentLive(); return; }
       const res = eraseStrokes(Store.strokes, eraserSt.points, eraserSt.radius);
-      if (res.changed) Store.commitChange(Store.strokes, res.strokes);
+      if (res.changed) {
+        Store.commitChange(Store.strokes, res.strokes);
+        Selection.clear();
+      }
       Renderer.redrawStatic();
       Renderer.presentLive();
     },
@@ -959,11 +1096,13 @@
     }
   }
 
-  // ── 框选与移动 ─────────────────────────────────────────────
+  // ── 框选/套索与移动(片段式选择:只选中落在区域内的部分) ────
   const Selection = {
-    mode: 'idle',            // idle | marquee | selected | moving
-    rect: null,              // 选框(页面坐标,未归一化)
-    selectedIds: new Set(),
+    mode: 'idle',                 // idle | marquee | selected | moving
+    region: null,                 // {type:'rect', r} | {type:'poly', pts}
+    selectedFragments: [],        // 被选中的片段(裁剪出的子笔迹)
+    remainderBySrc: new Map(),    // 源笔画 id → 区域外片段(移动/删除时保留)
+    affectedIds: new Set(),       // 受影响的源笔画 id
     moveStart: null,
     moveDelta: { x: 0, y: 0 },
     hasMoved: false,
@@ -974,7 +1113,7 @@
       this.bar.className = 'dw-selbar';
       this.bar.style.display = 'none';
       this.bar.innerHTML =
-        '<span class="dw-selbar-info">已选 <b class="dw-selbar-count">0</b> 笔</span>' +
+        '<span class="dw-selbar-info">已选 <b class="dw-selbar-count">0</b> 段</span>' +
         '<button id="dw-sel-del" title="删除所选 Delete">删除</button>' +
         '<button id="dw-sel-cancel" title="取消选择 Esc">取消</button>';
       this.bar.querySelector('#dw-sel-del').addEventListener('pointerdown', (e) => e.stopPropagation());
@@ -985,9 +1124,7 @@
     },
 
     destroy() {
-      this.mode = 'idle';
-      this.rect = null;
-      this.selectedIds.clear();
+      this.clear();
       if (this.bar) {
         this.bar.remove();
         this.bar = null;
@@ -996,25 +1133,42 @@
 
     hasSelection() { return this.mode === 'selected' || this.mode === 'moving'; },
 
-    selectionBBox() {
-      if (!this.selectedIds.size) return null;
+    fragmentsBBox(delta) {
+      if (!this.selectedFragments.length) return null;
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const s of Store.strokes) {
-        if (!this.selectedIds.has(s.id)) continue;
-        const bb = bboxOfPoints(strokeHitPoints(s));
-        if (bb.minX < minX) minX = bb.minX;
-        if (bb.minY < minY) minY = bb.minY;
-        if (bb.maxX > maxX) maxX = bb.maxX;
-        if (bb.maxY > maxY) maxY = bb.maxY;
+      for (const f of this.selectedFragments) {
+        for (const p of f.points) {
+          const x = p.x + (delta ? delta.x : 0), y = p.y + (delta ? delta.y : 0);
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
       }
       if (minX === Infinity) return null;
-      return { minX: minX - 4, minY: minY - 4, maxX: maxX + 4, maxY: maxY + 4 };
+      return { minX: minX - 6, minY: minY - 6, maxX: maxX + 6, maxY: maxY + 6 };
+    },
+
+    // 由当前区域重新计算被选片段 + 区域外保留片段
+    computeSelection() {
+      const insideAll = [];
+      const remainder = new Map();
+      for (const s of Store.strokes) {
+        const { inside, outside } = fragmentsForStroke(s, this.region);
+        if (inside.length) {
+          insideAll.push(...inside);
+          remainder.set(s.id, outside);
+        }
+      }
+      this.selectedFragments = insideAll;
+      this.remainderBySrc = remainder;
+      this.affectedIds = new Set(remainder.keys());
     },
 
     onDown(page) {
       if (this.hasSelection()) {
-        const bb = this.selectionBBox();
-        if (bb && pointInRect(page, bb)) {   // 点在选中框内 → 开始移动
+        const bb = this.fragmentsBBox(null);
+        if (bb && pointInRect(page, bb)) {   // 点在选中范围内 → 开始移动
           this.mode = 'moving';
           this.moveStart = page;
           this.moveDelta = { x: 0, y: 0 };
@@ -1025,38 +1179,41 @@
       }
       this.clear();
       this.mode = 'marquee';
-      this.rect = { x0: page.x, y0: page.y, x1: page.x, y1: page.y };
+      this.region = SETTINGS.selectMode === 'lasso'
+        ? { type: 'poly', pts: [page] }
+        : { type: 'rect', r: { x0: page.x, y0: page.y, x1: page.x, y1: page.y } };
     },
 
     onMove(page) {
-      if (this.mode === 'marquee' && this.rect) {
-        this.rect.x1 = page.x;
-        this.rect.y1 = page.y;
-        const r = this.normRect();
-        const ids = new Set();
-        for (const s of Store.strokes) {
-          if (rectHitsStroke(r, s)) ids.add(s.id);
+      if (this.mode === 'marquee' && this.region) {
+        if (this.region.type === 'rect') {
+          this.region.r.x1 = page.x;
+          this.region.r.y1 = page.y;
+        } else {
+          const pts = this.region.pts;
+          const last = pts[pts.length - 1];
+          if (!last || Coord.dist(page, last) > 1.5) pts.push(page);
         }
-        this.selectedIds = ids;
+        this.computeSelection();
       } else if (this.mode === 'moving' && this.moveStart) {
         this.moveDelta = { x: page.x - this.moveStart.x, y: page.y - this.moveStart.y };
         if (Math.abs(this.moveDelta.x) + Math.abs(this.moveDelta.y) > 2) {
           this.hasMoved = true;
-          const ids = this.selectedIds;
-          const preview = Store.strokes.map((s) => (ids.has(s.id) ? translateStroke(s, this.moveDelta.x, this.moveDelta.y) : s));
-          Renderer.redrawStaticWith(preview);
+          Renderer.redrawStaticWith(this.previewStrokes(this.moveDelta));
         }
       }
     },
 
     onUp() {
       if (this.mode === 'marquee') {
-        const r = this.normRect();
-        if (!r || (r.x1 - r.x0) < 3 || (r.y1 - r.y0) < 3 || !this.selectedIds.size) {
+        this.computeSelection();
+        let valid = this.selectedFragments.length > 0;
+        if (this.region && this.region.type === 'poly' && this.region.pts.length < 3) valid = false;
+        if (!valid) {
           this.clear();
         } else {
           this.mode = 'selected';
-          this.rect = null;
+          this.region = null;
           this.showBar();
           Renderer.presentLive();
         }
@@ -1068,23 +1225,68 @@
       }
     },
 
+    // 移动预览:区域外片段留在原位,选内片段按 delta 平移
+    previewStrokes(delta) {
+      const movedMap = new Map(this.selectedFragments.map((f) => [f.id, translateStroke(f, delta.x, delta.y)]));
+      const moved = [...movedMap.values()];
+      const before = Store.strokes;
+      if (this.remainderBySrc.size) {
+        const ids = this.affectedIds;
+        const out = [];
+        for (const s of before) {
+          if (ids.has(s.id)) {
+            out.push(...(this.remainderBySrc.get(s.id) || []));
+            for (const m of moved) if (m.srcId === s.id) out.push(m);
+          } else out.push(s);
+        }
+        return out;
+      }
+      return before.map((s) => (movedMap.has(s.id) ? movedMap.get(s.id) : s));
+    },
+
     commitMove() {
       const dx = this.moveDelta.x, dy = this.moveDelta.y;
       if (!dx && !dy) return;
-      const ids = this.selectedIds;
+      const movedMap = new Map(this.selectedFragments.map((f) => [f.id, translateStroke(f, dx, dy)]));
+      const moved = [...movedMap.values()];
       const before = Store.strokes;
-      const after = before.map((s) => (ids.has(s.id) ? translateStroke(s, dx, dy) : s));
+      let after;
+      if (this.remainderBySrc.size) {
+        const ids = this.affectedIds;
+        after = [];
+        for (const s of before) {
+          if (ids.has(s.id)) {
+            after.push(...(this.remainderBySrc.get(s.id) || []));
+            for (const m of moved) if (m.srcId === s.id) after.push(m);
+          } else after.push(s);
+        }
+      } else {
+        after = before.map((s) => (movedMap.has(s.id) ? movedMap.get(s.id) : s));
+      }
       Store.commitChange(before, after);
-      this.selectedIds = new Set();
-      after.forEach((s) => { if (ids.has(s.id)) this.selectedIds.add(s.id); });
+      this.selectedFragments = moved;
+      this.remainderBySrc = new Map();
+      this.affectedIds = new Set(moved.map((f) => f.id));
       Renderer.redrawStatic();
       Renderer.presentLive();
     },
 
     deleteSelected() {
-      if (!this.selectedIds.size) return;
       const before = Store.strokes;
-      const after = before.filter((s) => !this.selectedIds.has(s.id));
+      let after;
+      if (this.remainderBySrc.size) {
+        // 未移动:源笔画仍在 Store,删除 = 只保留区域外片段
+        const ids = this.affectedIds;
+        after = [];
+        for (const s of before) {
+          if (ids.has(s.id)) after.push(...(this.remainderBySrc.get(s.id) || []));
+          else after.push(s);
+        }
+      } else {
+        // 已移动:被选片段已在 Store,直接按 id 过滤
+        const ids = new Set(this.selectedFragments.map((f) => f.id));
+        after = before.filter((s) => !ids.has(s.id));
+      }
       if (after.length === before.length) return;
       Store.commitChange(before, after);
       Renderer.redrawStatic();
@@ -1093,55 +1295,30 @@
 
     clear() {
       this.mode = 'idle';
-      this.rect = null;
-      this.selectedIds.clear();
+      this.region = null;
+      this.selectedFragments = [];
+      this.remainderBySrc = new Map();
+      this.affectedIds = new Set();
       this.moveDelta = { x: 0, y: 0 };
       this.hasMoved = false;
       this.hideBar();
       Renderer.presentLive();
     },
 
-    normRect() {
-      if (!this.rect) return null;
-      return {
-        x0: Math.min(this.rect.x0, this.rect.x1),
-        y0: Math.min(this.rect.y0, this.rect.y1),
-        x1: Math.max(this.rect.x0, this.rect.x1),
-        y1: Math.max(this.rect.y0, this.rect.y1),
-      };
-    },
-
-    // 在实时层画选框/选中框/移动预览(页面坐标,ctx 已带视口偏移)
+    // 实时层:区域轮廓 + 选中片段高光
     render(ctx) {
-      let bb = null;
-      if (this.mode === 'marquee' && this.rect) {
-        const r = this.normRect();
-        bb = { minX: r.x0, minY: r.y0, maxX: r.x1, maxY: r.y1 };
-      } else if (this.hasSelection()) {
-        bb = this.selectionBBox();
-        if (bb && this.mode === 'moving') {
-          bb = {
-            minX: bb.minX + this.moveDelta.x, minY: bb.minY + this.moveDelta.y,
-            maxX: bb.maxX + this.moveDelta.x, maxY: bb.maxY + this.moveDelta.y,
-          };
-        }
+      if (this.mode === 'marquee' && this.region) drawRegionOutline(ctx, this.region);
+      const delta = this.mode === 'moving' ? this.moveDelta : null;
+      for (const f of this.selectedFragments) drawFragmentHighlight(ctx, f, delta);
+      if (this.mode === 'selected') {
+        const bb = this.fragmentsBBox(null);
+        if (bb) this.positionBar(bb);
       }
-      if (!bb) return;
-      ctx.save();
-      ctx.strokeStyle = '#2f7bff';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 4]);
-      ctx.fillStyle = this.mode === 'moving' ? 'rgba(47,123,255,0.10)' : 'rgba(47,123,255,0.08)';
-      ctx.fillRect(bb.minX, bb.minY, bb.maxX - bb.minX, bb.maxY - bb.minY);
-      ctx.strokeRect(bb.minX, bb.minY, bb.maxX - bb.minX, bb.maxY - bb.minY);
-      ctx.restore();
-
-      if (this.mode === 'selected') this.positionBar(bb);
     },
 
     showBar() {
       if (!this.bar) return;
-      this.bar.querySelector('.dw-selbar-count').textContent = this.selectedIds.size;
+      this.bar.querySelector('.dw-selbar-count').textContent = this.selectedFragments.length;
       this.bar.style.display = 'flex';
     },
     hideBar() {
@@ -1157,6 +1334,52 @@
       this.bar.style.top = top + 'px';
     },
   };
+
+  // 画选择区域轮廓(矩形或套索多边形)
+  function drawRegionOutline(ctx, region) {
+    ctx.save();
+    ctx.strokeStyle = '#2f7bff';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 4]);
+    if (region.type === 'rect') {
+      const r = region.r;
+      ctx.fillStyle = 'rgba(47,123,255,0.08)';
+      ctx.fillRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+      ctx.strokeRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0);
+    } else {
+      const pts = region.pts;
+      if (pts.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+        if (pts.length >= 3) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(47,123,255,0.06)';
+          ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
+  // 选中片段的高光(蓝色发光描边)
+  function drawFragmentHighlight(ctx, f, delta) {
+    ctx.save();
+    ctx.shadowColor = '#4da3ff';
+    ctx.shadowBlur = 12;
+    if (delta) {
+      drawStroke(ctx, Object.assign({}, f, {
+        points: f.points.map((p) => ({ x: p.x + delta.x, y: p.y + delta.y, p: p.p, tilt: p.tilt })),
+      }));
+    } else {
+      drawStroke(ctx, f);
+    }
+    ctx.restore();
+  }
 
   // 平移一笔(复制出新对象,新 id,供移动/预览用)
   function translateStroke(s, dx, dy) {
@@ -1180,6 +1403,10 @@
         '<button id="dw-min" title="收起/展开">–</button></div>' +
         '<div class="dw-body">' +
           '<div class="dw-sec dw-tools"></div>' +
+          '<div class="dw-sec dw-selmode-row" id="dw-selmode-row">' +
+            '<button id="dw-selmode-rect" title="矩形框选">▭ 框选</button>' +
+            '<button id="dw-selmode-lasso" title="不规则套索(自由圈选)">⤫ 套索</button>' +
+          '</div>' +
           '<div class="dw-sec dw-styles">' +
             '<div class="dw-row dw-swatches"></div>' +
             '<div class="dw-row dw-size-row">' +
@@ -1202,6 +1429,7 @@
               '<button id="dw-hide" title="隐藏/显示草稿 H">隐藏</button>' +
               '<button id="dw-export" title="导出截图 Ctrl+S">导出</button>' +
               '<button id="dw-mouse" title="用鼠标画画(默认关闭)">🖱 鼠标</button>' +
+              '<button id="dw-help" title="快捷键一览">⌨ 快捷键</button>' +
               '<button id="dw-exit" title="退出 Esc">退出</button>' +
             '</div>' +
           '</div>' +
@@ -1272,10 +1500,22 @@
       bind('dw-export', () => Export.run());
       bind('dw-exit', () => App.exit());
       bind('dw-mouse', () => { SETTINGS.drawWithMouse = !SETTINGS.drawWithMouse; this.sync(); });
+      bind('dw-help', () => this.toggleHelp());
+      this.el.querySelector('#dw-selmode-rect').addEventListener('click', (e) => {
+        e.stopPropagation();
+        SETTINGS.selectMode = 'rect';
+        this.sync();
+      });
+      this.el.querySelector('#dw-selmode-lasso').addEventListener('click', (e) => {
+        e.stopPropagation();
+        SETTINGS.selectMode = 'lasso';
+        this.sync();
+      });
       this.el.querySelector('#dw-min').addEventListener('click', (e) => {
         e.stopPropagation();
         this.el.classList.toggle('dw-collapsed');
       });
+      this._buildHelp();
 
       initDrag(this.el);
 
@@ -1329,6 +1569,29 @@
       row.appendChild(custom);
     },
 
+    _buildHelp() {
+      this.helpPanel = document.createElement('div');
+      this.helpPanel.id = 'dw-shortcuts';
+      this.helpPanel.style.display = 'none';
+      let rows = '';
+      for (const [k, v] of SHORTCUT_LIST) rows += '<tr><td class="dw-k">' + k + '</td><td>' + v + '</td></tr>';
+      this.helpPanel.innerHTML =
+        '<div class="dw-shortcuts-head"><span>⌨ 快捷键</span><button id="dw-shortcuts-close" title="关闭">×</button></div>' +
+        '<table>' + rows + '</table>';
+      this.helpPanel.querySelector('#dw-shortcuts-close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggleHelp(false);
+      });
+      root.appendChild(this.helpPanel);
+    },
+    toggleHelp(open) {
+      if (!this.helpPanel) return;
+      const show = open === undefined ? this.helpPanel.style.display === 'none' : open;
+      this.helpPanel.style.display = show ? 'block' : 'none';
+    },
+    closeHelp() { this.toggleHelp(false); },
+    isHelpOpen() { return !!(this.helpPanel && this.helpPanel.style.display !== 'none'); },
+
     // 从 SETTINGS 同步全部控件
     sync() {
       const def = TOOL_DEFS[SETTINGS.tool];
@@ -1359,6 +1622,13 @@
       const mouse = this.el.querySelector('#dw-mouse');
       mouse.textContent = SETTINGS.drawWithMouse ? '🖱 鼠标:开' : '🖱 鼠标';
       mouse.classList.toggle('dw-active', SETTINGS.drawWithMouse);
+      // 选择方式切换(仅选择工具激活时显示)
+      const selRow = this.el.querySelector('#dw-selmode-row');
+      if (selRow) {
+        selRow.style.display = SETTINGS.tool === 'select' ? 'flex' : 'none';
+        this.el.querySelector('#dw-selmode-rect').classList.toggle('dw-active', SETTINGS.selectMode === 'rect');
+        this.el.querySelector('#dw-selmode-lasso').classList.toggle('dw-active', SETTINGS.selectMode === 'lasso');
+      }
       this.setColor(SETTINGS.color);
     },
 
@@ -1377,6 +1647,10 @@
 
     destroy() {
       clearTimeout(this._fadeTimer);
+      if (this.helpPanel) {
+        this.helpPanel.remove();
+        this.helpPanel = null;
+      }
       if (this.el) {
         this.el.remove();
         this.el = null;
@@ -1502,6 +1776,7 @@
 
     undo() {
       Editor.commit();
+      Selection.clear();
       if (Store.undo()) {
         Renderer.redrawStatic();
         Renderer.presentLive();
@@ -1510,6 +1785,7 @@
 
     clear() {
       Editor.commit();
+      Selection.clear();
       if (Store.clear()) {
         Renderer.redrawStatic();
         Renderer.presentLive();
@@ -1532,7 +1808,8 @@
 
       if (e.key === 'Escape') {
         e.preventDefault();
-        if (Selection.hasSelection()) Selection.clear();
+        if (Toolbar.isHelpOpen()) Toolbar.closeHelp();
+        else if (Selection.hasSelection()) Selection.clear();
         else this.destroy();
       } else if (e.key === 'Delete' || e.key === 'Backspace') {
         if (Selection.hasSelection()) {
@@ -1563,6 +1840,7 @@
       else if (e.key === 'r' || e.key === 'R') this.selectTool('rect');
       else if (e.key === 'o' || e.key === 'O') this.selectTool('ellipse');
       else if (e.key === 'h' || e.key === 'H') this.toggleHide();
+      else if (e.key === '?') { e.preventDefault(); Toolbar.toggleHelp(); }
       else if (e.key === '[') { SETTINGS.width = clamp(SETTINGS.width - 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
       else if (e.key === ']') { SETTINGS.width = clamp(SETTINGS.width + 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
     },
