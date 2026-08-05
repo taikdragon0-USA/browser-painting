@@ -30,7 +30,7 @@
   // 工具分组
   const BRUSH_TOOLS = ['pen', 'marker', 'highlighter', 'pencil', 'neon'];
   const SHAPE_TOOLS = ['line', 'arrow', 'rect', 'ellipse'];
-  const TOOL_ORDER = [...BRUSH_TOOLS, ...SHAPE_TOOLS, 'text', 'eraser'];
+  const TOOL_ORDER = ['select', ...BRUSH_TOOLS, ...SHAPE_TOOLS, 'text', 'eraser'];
   const IS_BRUSH = (t) => BRUSH_TOOLS.includes(t);
   const IS_SHAPE = (t) => SHAPE_TOOLS.includes(t);
 
@@ -44,10 +44,11 @@
     arrow:      { name: '箭头',   icon: '➡️', shortcut: 'A', wMin: 1, wMax: 30 },
     rect:       { name: '矩形',   icon: '▭',  shortcut: 'R', wMin: 1, wMax: 30 },
     ellipse:    { name: '椭圆',   icon: '◯',  shortcut: 'O', wMin: 1, wMax: 30 },
+    select:     { name: '选择',   icon: '↖',  shortcut: 'V', wMin: 1, wMax: 40 },
     text:       { name: '文字',   icon: '🆃', shortcut: 'T', wMin: 10, wMax: 72 },
     eraser:     { name: '橡皮',   icon: '🧽', shortcut: 'E', wMin: 5, wMax: 60 },
   };
-  const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', text: '字号', eraser: '橡皮大小' };
+  const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', select: '—', text: '字号', eraser: '橡皮大小' };
 
   // 可通过 window.DW_CONFIG 覆盖(dev-test.html 用)
   const SETTINGS = Object.assign(
@@ -116,6 +117,50 @@
   }
   function bboxIntersects(a, b) {
     return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+  }
+
+  function pointInRect(p, r) {
+    return p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1;
+  }
+  function segsIntersect(p1, p2, p3, p4) {
+    const o1 = (p2.x - p1.x) * (p3.y - p1.y) - (p2.y - p1.y) * (p3.x - p1.x);
+    const o2 = (p2.x - p1.x) * (p4.y - p1.y) - (p2.y - p1.y) * (p4.x - p1.x);
+    const o3 = (p4.x - p3.x) * (p1.y - p3.y) - (p4.y - p3.y) * (p1.x - p3.x);
+    const o4 = (p4.x - p3.x) * (p2.y - p3.y) - (p4.y - p3.y) * (p2.x - p3.x);
+    return o1 * o2 < 0 && o3 * o4 < 0;
+  }
+  function segIntersectsRect(p1, p2, r) {
+    if (pointInRect(p1, r) || pointInRect(p2, r)) return true;
+    const c = [{ x: r.x0, y: r.y0 }, { x: r.x1, y: r.y0 }, { x: r.x1, y: r.y1 }, { x: r.x0, y: r.y1 }];
+    for (let i = 0; i < 4; i++) {
+      if (segsIntersect(p1, p2, c[i], c[(i + 1) % 4])) return true;
+    }
+    return false;
+  }
+  // 一笔的"采样点"(文字取文字框四角,图形取角点,笔刷取全部点)
+  function strokeHitPoints(stroke) {
+    const tool = stroke.tool || 'pen';
+    if (tool === 'text') {
+      const p = stroke.points[0];
+      const w = String(stroke.text || '').length * stroke.fontSize * 0.6;
+      const h = stroke.fontSize;
+      return [{ x: p.x, y: p.y }, { x: p.x + w, y: p.y }, { x: p.x + w, y: p.y + h }, { x: p.x, y: p.y + h }];
+    }
+    if (IS_SHAPE(tool)) {
+      const a = stroke.points[0], b = stroke.points[stroke.points.length - 1];
+      if (tool === 'line' || tool === 'arrow') return [a, b];
+      return [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }];
+    }
+    return stroke.points;
+  }
+  // 判定一笔是否落在选择框内(点在内 / 线段穿过)
+  function rectHitsStroke(r, stroke) {
+    const pts = strokeHitPoints(stroke);
+    for (let i = 0; i < pts.length; i++) {
+      if (pointInRect(pts[i], r)) return true;
+      if (i && segIntersectsRect(pts[i - 1], pts[i], r)) return true;
+    }
+    return false;
   }
 
   // ── 坐标换算 ───────────────────────────────────────────────
@@ -469,26 +514,24 @@
       const ctx = this.ctx;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, bw, bh);
-      if (!Input.activePointers.size) return;
       ctx.setTransform(dpr, 0, 0, dpr, -window.scrollX * dpr, -window.scrollY * dpr);
 
-      if (SETTINGS.showDrafts) {
-        for (const [, s] of Input.activePointers) {
-          if (s.mode !== 'eraser') drawStroke(ctx, s);
-        }
-      }
-      // 橡皮光标轨迹
       for (const [, s] of Input.activePointers) {
-        if (s.mode !== 'eraser') continue;
-        ctx.globalAlpha = 0.3;
-        ctx.fillStyle = '#666';
-        for (const p of s.points) {
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, s.radius, 0, Math.PI * 2);
-          ctx.fill();
+        if (s.mode === 'eraser') {
+          ctx.globalAlpha = 0.3;
+          ctx.fillStyle = '#666';
+          for (const p of s.points) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, s.radius, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        } else if (!s.mode && SETTINGS.showDrafts) {
+          drawStroke(ctx, s);
         }
-        ctx.globalAlpha = 1;
       }
+
+      Selection.render(ctx);   // 选框 / 选中框 / 移动预览
     },
 
     requestLive() {
@@ -579,6 +622,13 @@
       }
       if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.lockPen();
 
+      if (tool === 'select') {
+        this.activePointers.set(e.pointerId, { mode: 'select' });
+        Selection.onDown(Coord.toPage(e));
+        Renderer.requestLive();
+        return;
+      }
+
       if (tool === 'eraser') {
         this.activePointers.set(e.pointerId, {
           mode: 'eraser',
@@ -607,6 +657,15 @@
     onMove(e) {
       const st = this.activePointers.get(e.pointerId);
       if (!st) return;
+
+      // 框选
+      if (st.mode === 'select') {
+        if (!(e.buttons & 1)) { this.endStroke(e.pointerId); return; }
+        e.preventDefault();
+        Selection.onMove(Coord.toPage(e));
+        Renderer.requestLive();
+        return;
+      }
 
       // 橡皮擦
       if (st.mode === 'eraser') {
@@ -669,6 +728,10 @@
       this.activePointers.delete(pointerId);
       if (!st) return;
 
+      if (st.mode === 'select') {
+        Selection.onUp();
+        return;
+      }
       if (st.mode === 'eraser') {
         this.finishErase(st);
         return;
@@ -894,6 +957,213 @@
     } catch (err) {
       return false;
     }
+  }
+
+  // ── 框选与移动 ─────────────────────────────────────────────
+  const Selection = {
+    mode: 'idle',            // idle | marquee | selected | moving
+    rect: null,              // 选框(页面坐标,未归一化)
+    selectedIds: new Set(),
+    moveStart: null,
+    moveDelta: { x: 0, y: 0 },
+    hasMoved: false,
+    bar: null,
+
+    init() {
+      this.bar = document.createElement('div');
+      this.bar.className = 'dw-selbar';
+      this.bar.style.display = 'none';
+      this.bar.innerHTML =
+        '<span class="dw-selbar-info">已选 <b class="dw-selbar-count">0</b> 笔</span>' +
+        '<button id="dw-sel-del" title="删除所选 Delete">删除</button>' +
+        '<button id="dw-sel-cancel" title="取消选择 Esc">取消</button>';
+      this.bar.querySelector('#dw-sel-del').addEventListener('pointerdown', (e) => e.stopPropagation());
+      this.bar.querySelector('#dw-sel-del').addEventListener('click', (e) => { e.stopPropagation(); this.deleteSelected(); });
+      this.bar.querySelector('#dw-sel-cancel').addEventListener('pointerdown', (e) => e.stopPropagation());
+      this.bar.querySelector('#dw-sel-cancel').addEventListener('click', (e) => { e.stopPropagation(); this.clear(); });
+      root.appendChild(this.bar);
+    },
+
+    destroy() {
+      this.mode = 'idle';
+      this.rect = null;
+      this.selectedIds.clear();
+      if (this.bar) {
+        this.bar.remove();
+        this.bar = null;
+      }
+    },
+
+    hasSelection() { return this.mode === 'selected' || this.mode === 'moving'; },
+
+    selectionBBox() {
+      if (!this.selectedIds.size) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const s of Store.strokes) {
+        if (!this.selectedIds.has(s.id)) continue;
+        const bb = bboxOfPoints(strokeHitPoints(s));
+        if (bb.minX < minX) minX = bb.minX;
+        if (bb.minY < minY) minY = bb.minY;
+        if (bb.maxX > maxX) maxX = bb.maxX;
+        if (bb.maxY > maxY) maxY = bb.maxY;
+      }
+      if (minX === Infinity) return null;
+      return { minX: minX - 4, minY: minY - 4, maxX: maxX + 4, maxY: maxY + 4 };
+    },
+
+    onDown(page) {
+      if (this.hasSelection()) {
+        const bb = this.selectionBBox();
+        if (bb && pointInRect(page, bb)) {   // 点在选中框内 → 开始移动
+          this.mode = 'moving';
+          this.moveStart = page;
+          this.moveDelta = { x: 0, y: 0 };
+          this.hasMoved = false;
+          this.hideBar();
+          return;
+        }
+      }
+      this.clear();
+      this.mode = 'marquee';
+      this.rect = { x0: page.x, y0: page.y, x1: page.x, y1: page.y };
+    },
+
+    onMove(page) {
+      if (this.mode === 'marquee' && this.rect) {
+        this.rect.x1 = page.x;
+        this.rect.y1 = page.y;
+        const r = this.normRect();
+        const ids = new Set();
+        for (const s of Store.strokes) {
+          if (rectHitsStroke(r, s)) ids.add(s.id);
+        }
+        this.selectedIds = ids;
+      } else if (this.mode === 'moving' && this.moveStart) {
+        this.moveDelta = { x: page.x - this.moveStart.x, y: page.y - this.moveStart.y };
+        if (Math.abs(this.moveDelta.x) + Math.abs(this.moveDelta.y) > 2) {
+          this.hasMoved = true;
+          const ids = this.selectedIds;
+          const preview = Store.strokes.map((s) => (ids.has(s.id) ? translateStroke(s, this.moveDelta.x, this.moveDelta.y) : s));
+          Renderer.redrawStaticWith(preview);
+        }
+      }
+    },
+
+    onUp() {
+      if (this.mode === 'marquee') {
+        const r = this.normRect();
+        if (!r || (r.x1 - r.x0) < 3 || (r.y1 - r.y0) < 3 || !this.selectedIds.size) {
+          this.clear();
+        } else {
+          this.mode = 'selected';
+          this.rect = null;
+          this.showBar();
+          Renderer.presentLive();
+        }
+      } else if (this.mode === 'moving') {
+        this.mode = 'selected';
+        if (this.hasMoved) this.commitMove();
+        this.showBar();
+        Renderer.presentLive();
+      }
+    },
+
+    commitMove() {
+      const dx = this.moveDelta.x, dy = this.moveDelta.y;
+      if (!dx && !dy) return;
+      const ids = this.selectedIds;
+      const before = Store.strokes;
+      const after = before.map((s) => (ids.has(s.id) ? translateStroke(s, dx, dy) : s));
+      Store.commitChange(before, after);
+      this.selectedIds = new Set();
+      after.forEach((s) => { if (ids.has(s.id)) this.selectedIds.add(s.id); });
+      Renderer.redrawStatic();
+      Renderer.presentLive();
+    },
+
+    deleteSelected() {
+      if (!this.selectedIds.size) return;
+      const before = Store.strokes;
+      const after = before.filter((s) => !this.selectedIds.has(s.id));
+      if (after.length === before.length) return;
+      Store.commitChange(before, after);
+      Renderer.redrawStatic();
+      this.clear();
+    },
+
+    clear() {
+      this.mode = 'idle';
+      this.rect = null;
+      this.selectedIds.clear();
+      this.moveDelta = { x: 0, y: 0 };
+      this.hasMoved = false;
+      this.hideBar();
+      Renderer.presentLive();
+    },
+
+    normRect() {
+      if (!this.rect) return null;
+      return {
+        x0: Math.min(this.rect.x0, this.rect.x1),
+        y0: Math.min(this.rect.y0, this.rect.y1),
+        x1: Math.max(this.rect.x0, this.rect.x1),
+        y1: Math.max(this.rect.y0, this.rect.y1),
+      };
+    },
+
+    // 在实时层画选框/选中框/移动预览(页面坐标,ctx 已带视口偏移)
+    render(ctx) {
+      let bb = null;
+      if (this.mode === 'marquee' && this.rect) {
+        const r = this.normRect();
+        bb = { minX: r.x0, minY: r.y0, maxX: r.x1, maxY: r.y1 };
+      } else if (this.hasSelection()) {
+        bb = this.selectionBBox();
+        if (bb && this.mode === 'moving') {
+          bb = {
+            minX: bb.minX + this.moveDelta.x, minY: bb.minY + this.moveDelta.y,
+            maxX: bb.maxX + this.moveDelta.x, maxY: bb.maxY + this.moveDelta.y,
+          };
+        }
+      }
+      if (!bb) return;
+      ctx.save();
+      ctx.strokeStyle = '#2f7bff';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 4]);
+      ctx.fillStyle = this.mode === 'moving' ? 'rgba(47,123,255,0.10)' : 'rgba(47,123,255,0.08)';
+      ctx.fillRect(bb.minX, bb.minY, bb.maxX - bb.minX, bb.maxY - bb.minY);
+      ctx.strokeRect(bb.minX, bb.minY, bb.maxX - bb.minX, bb.maxY - bb.minY);
+      ctx.restore();
+
+      if (this.mode === 'selected') this.positionBar(bb);
+    },
+
+    showBar() {
+      if (!this.bar) return;
+      this.bar.querySelector('.dw-selbar-count').textContent = this.selectedIds.size;
+      this.bar.style.display = 'flex';
+    },
+    hideBar() {
+      if (this.bar) this.bar.style.display = 'none';
+    },
+    positionBar(bb) {
+      if (!this.bar || this.bar.style.display === 'none') return;
+      let left = bb.minX - window.scrollX;
+      let top = bb.minY - window.scrollY - 36;
+      left = clamp(left, 8, window.innerWidth - 170);
+      top = clamp(top, 8, window.innerHeight - 40);
+      this.bar.style.left = left + 'px';
+      this.bar.style.top = top + 'px';
+    },
+  };
+
+  // 平移一笔(复制出新对象,新 id,供移动/预览用)
+  function translateStroke(s, dx, dy) {
+    return Object.assign({}, s, {
+      id: ++Input._uid,
+      points: s.points.map((p) => ({ x: p.x + dx, y: p.y + dy, p: p.p, tilt: p.tilt })),
+    });
   }
 
   // ── 浮动工具栏 ─────────────────────────────────────────────
@@ -1183,6 +1453,7 @@
       document.documentElement.appendChild(root);
 
       Toolbar.init();
+      Selection.init();
       Renderer.init();
       Input.init();
       Persist.init();
@@ -1204,6 +1475,7 @@
       this.alive = false;
       document.removeEventListener('keydown', this._hKey, true);
       Editor.cancel();
+      Selection.destroy();
       Input.destroy();
       Renderer.destroy();
       Persist.destroy();
@@ -1217,6 +1489,7 @@
 
     selectTool(t) {
       Editor.commit();
+      if (t !== 'select') Selection.clear();   // 切到别的工具时取消选择
       if (t === 'eraser' && SETTINGS.tool !== 'eraser') this._prevTool = SETTINGS.tool;
       SETTINGS.tool = t;
       Toolbar.sync();
@@ -1259,7 +1532,13 @@
 
       if (e.key === 'Escape') {
         e.preventDefault();
-        this.destroy();
+        if (Selection.hasSelection()) Selection.clear();
+        else this.destroy();
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (Selection.hasSelection()) {
+          e.preventDefault();
+          Selection.deleteSelected();
+        }
       } else if (ctrl && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault();
         e.stopPropagation();
@@ -1278,7 +1557,8 @@
         this.selectTool(SETTINGS.tool === 'eraser' ? (this._prevTool || 'pen') : 'eraser');
       } else if (e.key === 't' || e.key === 'T') {
         this.selectTool('text');
-      } else if (e.key === 'l' || e.key === 'L') this.selectTool('line');
+      } else if (e.key === 'v' || e.key === 'V') this.selectTool('select');
+      else if (e.key === 'l' || e.key === 'L') this.selectTool('line');
       else if (e.key === 'a' || e.key === 'A') this.selectTool('arrow');
       else if (e.key === 'r' || e.key === 'R') this.selectTool('rect');
       else if (e.key === 'o' || e.key === 'O') this.selectTool('ellipse');

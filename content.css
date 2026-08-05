@@ -202,6 +202,35 @@ html[data-dw-lock] {
   z-index: 2147483647;
 }
 
+/* 框选操作条 */
+#draw-root .dw-selbar {
+  position: fixed;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+  pointer-events: auto;
+  z-index: 2147483647;
+  font: 12px system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  white-space: nowrap;
+}
+#draw-root .dw-selbar-info { color: #555; }
+#draw-root .dw-selbar-count { color: #2f7bff; }
+#draw-root .dw-selbar button {
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 5px;
+  background: #fff;
+  cursor: pointer;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: #333;
+}
+#draw-root .dw-selbar button:hover { background: #f0f6ff; }
+
 /* 轻提示 */
 #draw-root .dw-toast {
   position: fixed;
