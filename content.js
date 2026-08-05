@@ -1,48 +1,62 @@
 // ============================================================
-// Web Draw — 网页绘画 content script
-// 在任意网页之上用触控笔/鼠标画画,草稿锚定在"页面坐标",随网页滚动而移动。
+// Web Draw — 网页绘画 content script (v0.3.0)
+// 在任意网页之上画画/标注:五种笔刷、图形、文字、橡皮擦、自动保存、导出截图。
+// 草稿锚定在"页面坐标",静态画布在文档流中随网页原生滚动 → 滚动零错位。
 //
 // 架构(单个 IIFE,内部按命名空间模块划分):
 //   Coord     坐标换算(页面坐标 <-> 视口坐标)
-//   Store     已提交笔迹的纯数据层
-//   Renderer  双 canvas 渲染:
-//              · 静态层 = 全页尺寸画布,绝对定位在文档流中,由浏览器随页面原生滚动
-//                → 草稿与网页内容零错位,滚动时无需任何重绘
-//              · 实时层 = 视口尺寸画布,仅叠加"进行中"的笔画
-//   Input     指针分流(pen 画 / touch 放行 / mouse 可选),document capture 监听
-//   Toolbar   浮动工具栏(颜色/粗细/撤销/清空/鼠标画开关/退出/拖动)
+//   Store     笔迹数据 + 快照式历史(撤销可回退任何操作,含橡皮擦)
+//   Renderer  双 canvas 渲染(全页静态层 + 视口实时层)
+//   Input     指针分流(按 tool 路由:笔刷/图形/橡皮/文字),document capture
+//   Editor    文字工具的内联输入框
+//   Persist   草稿自动保存/恢复(localStorage,按 URL 分键)
+//   Export    导出全页截图(合成优先,失败退纯草稿)
+//   Toolbar   浮动工具栏(工具格/样式/操作/设置)
 //   App       状态机与装配;window.__dwInstance 幂等开关
-//
-// 关键机制:
-//   1. 滚动锚定 —— 笔迹以页面坐标(absolute)存储;静态画布是文档流的一部分,
-//      滚动由浏览器合成器原生完成 → 快速滚动也零位移、零复位。
-//   2. 智能输入 —— 画布 pointer-events:none,所有 pointer 监听挂在 document
-//      capture 阶段,按 pointerType 分流:pen 落下即画并临时给 <html> 加
-//      data-dw-lock(touch-action:none)冻结笔画期间的整页 panning;
-//      touch/mouse 完全放行,手指滚动、鼠标滚轮照常。
-//   3. 压感 —— 数位板(高漫 1060 Pro)经 Windows Ink 被识别为 pointerType:'pen',
-//      event.pressure(0~1) 即 8192 级压感;落笔判定用 e.buttons&1(悬空不发笔),
-//      高速书写用 getCoalescedEvents() 取回全部采样。
 // ============================================================
 (function () {
   'use strict';
 
-  // ── 常量 / 设置 ────────────────────────────────────────────
+  // ── 常量 ───────────────────────────────────────────────────
   const Z_INDEX = 2147483647;
-  const MAX_STROKES = 2000;       // 笔迹总量上限(超出自动丢弃最早)
-  const MAX_POINTS = 5000;        // 单笔采样点数上限
-  const MIN_DIST = 1.2;           // 采样最小间距(css px),去重减点
-  const PRESSURE_EXP = 0.7;       // 压感幂次曲线指数(<1:轻笔易出细线,重笔更饱满)
-  const PRESSURE_MIN = 0.15;      // 最小线宽比例(防断线)
+  const MAX_STROKES = 2000;
+  const MAX_POINTS = 5000;
+  const MIN_DIST = 1.2;
+  const MAX_HISTORY = 100;
   const SWATCHES = ['#ff3b30', '#ffa400', '#ffe10a', '#1fcecb', '#2f7bff', '#1c1c1c'];
+  const MAX_CANVAS_AREA = 24 * 1024 * 1024;
+  const MAX_CANVAS_DIM = 32767;
 
-  // 全页静态画布的设备像素上限(超长/超高页面自动降分辨率,保证内存可控)
-  const MAX_CANVAS_AREA = 24 * 1024 * 1024;   // ~25MP ≈ 96MB
-  const MAX_CANVAS_DIM = 32767;               // Chrome 单边尺寸上限
+  // 工具分组
+  const BRUSH_TOOLS = ['pen', 'marker', 'highlighter', 'pencil', 'neon'];
+  const SHAPE_TOOLS = ['line', 'arrow', 'rect', 'ellipse'];
+  const TOOL_ORDER = [...BRUSH_TOOLS, ...SHAPE_TOOLS, 'text', 'eraser'];
+  const IS_BRUSH = (t) => BRUSH_TOOLS.includes(t);
+  const IS_SHAPE = (t) => SHAPE_TOOLS.includes(t);
+
+  const TOOL_DEFS = {
+    pen:        { name: '钢笔',   icon: '✒️', shortcut: 'B', wMin: 1, wMax: 40 },
+    marker:     { name: '马克笔', icon: '🖊️', shortcut: '',  wMin: 1, wMax: 40 },
+    highlighter:{ name: '荧光笔', icon: '🖍️', shortcut: '',  wMin: 5, wMax: 80 },
+    pencil:     { name: '铅笔',   icon: '✏️', shortcut: '',  wMin: 1, wMax: 40 },
+    neon:       { name: '霓虹',   icon: '⚡',  shortcut: '',  wMin: 1, wMax: 40 },
+    line:       { name: '直线',   icon: '╱',  shortcut: 'L', wMin: 1, wMax: 30 },
+    arrow:      { name: '箭头',   icon: '➡️', shortcut: 'A', wMin: 1, wMax: 30 },
+    rect:       { name: '矩形',   icon: '▭',  shortcut: 'R', wMin: 1, wMax: 30 },
+    ellipse:    { name: '椭圆',   icon: '◯',  shortcut: 'O', wMin: 1, wMax: 30 },
+    text:       { name: '文字',   icon: '🆃', shortcut: 'T', wMin: 10, wMax: 72 },
+    eraser:     { name: '橡皮',   icon: '🧽', shortcut: 'E', wMin: 5, wMax: 60 },
+  };
+  const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', text: '字号', eraser: '橡皮大小' };
 
   // 可通过 window.DW_CONFIG 覆盖(dev-test.html 用)
   const SETTINGS = Object.assign(
-    { color: '#ff3b30', width: 4, drawWithMouse: false },
+    {
+      color: '#ff3b30', width: 4, drawWithMouse: false,
+      tool: 'pen', opacity: 1,
+      pressureExp: 0.7, pressureMin: 0.15,
+      autoSave: true, showDrafts: true,
+    },
     window.DW_CONFIG || {}
   );
 
@@ -55,7 +69,6 @@
     return tag === 'input' || tag === 'textarea' || tag === 'select' || !!t.isContentEditable;
   }
 
-  // 画布有效分辨率:全页画布尺寸超出上限时按比例降 dpr,超长页面仍可工作
   function computeEffDpr(w, h, dpr) {
     let eff = dpr;
     if (w * eff > MAX_CANVAS_DIM) eff = MAX_CANVAS_DIM / w;
@@ -65,119 +78,309 @@
     return Math.max(0.25, Math.min(dpr, eff));
   }
 
+  function hashStr(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+    return String(h >>> 0);
+  }
+
+  // 几何工具
+  function distPointToSegment(p, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 === 0) return Coord.dist(p, a);
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    t = clamp(t, 0, 1);
+    const cx = a.x + t * dx, cy = a.y + t * dy;
+    return Coord.dist(p, { x: cx, y: cy });
+  }
+  function distToPath(p, path) {
+    if (!path.length) return Infinity;
+    if (path.length === 1) return Coord.dist(p, path[0]);
+    let m = Infinity;
+    for (let i = 0; i < path.length - 1; i++) {
+      const d = distPointToSegment(p, path[i], path[i + 1]);
+      if (d < m) m = d;
+    }
+    return m;
+  }
+  function bboxOfPoints(pts) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of pts) {
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    return { minX, minY, maxX, maxY };
+  }
+  function bboxIntersects(a, b) {
+    return a.minX <= b.maxX && a.maxX >= b.minX && a.minY <= b.maxY && a.maxY >= b.minY;
+  }
+
   // ── 坐标换算 ───────────────────────────────────────────────
   const Coord = {
-    // 事件坐标(clientX/Y 布局视口) → 页面坐标
-    toPage(ev) {
-      return { x: ev.clientX + window.scrollX, y: ev.clientY + window.scrollY };
-    },
+    toPage(ev) { return { x: ev.clientX + window.scrollX, y: ev.clientY + window.scrollY }; },
     dist(a, b) {
       const dx = a.x - b.x, dy = a.y - b.y;
       return Math.sqrt(dx * dx + dy * dy);
     },
   };
 
-  // ── 数据层(只存已提交笔迹) ────────────────────────────────
+  // ── 数据层(快照式历史) ─────────────────────────────────────
   const Store = {
     strokes: [],
-    add(s) {
-      this.strokes.push(s);
-      if (this.strokes.length > MAX_STROKES) this.strokes.shift();
+    history: [],
+    onChange: null,               // Persist 订阅:任何变更后触发保存
+
+    commitChange(before, after) {
+      if (after.length > MAX_STROKES) {           // 笔迹总量上限,丢弃最旧
+        const drop = after.length - MAX_STROKES;
+        after = after.slice(drop);
+        before = before.slice(Math.max(0, before.length - MAX_STROKES));
+      }
+      this.history.push({ before: before, after: after });
+      if (this.history.length > MAX_HISTORY) this.history.shift();
+      this.strokes = after;
+      if (this.onChange) this.onChange();
     },
     undo() {
-      if (!this.strokes.length) return false;
-      this.strokes.pop();
+      if (!this.history.length) return false;
+      const op = this.history.pop();
+      this.strokes = op.before;
+      if (this.onChange) this.onChange();
       return true;
     },
     clear() {
       if (!this.strokes.length) return false;
-      this.strokes = [];
+      this.commitChange(this.strokes, []);
       return true;
     },
+    canUndo() { return this.history.length > 0; },
   };
 
   // ── 压感与线条 ─────────────────────────────────────────────
-  function normPressure(p) { return Math.pow(clamp(p, 0, 1), PRESSURE_EXP); }
+  function normPressure(p) { return Math.pow(clamp(p, 0, 1), SETTINGS.pressureExp); }
 
-  function widthFor(stroke, pt) {
-    return stroke.width * (PRESSURE_MIN + (1 - PRESSURE_MIN) * normPressure(pt.p));
+  // 笔刷类线宽(按工具定宽,荧光笔恒定无压感)
+  function brushWidthFor(stroke, pt) {
+    const tool = stroke.tool || 'pen';
+    const p = tool === 'highlighter' ? 1 : normPressure(pt.p);
+    let base = stroke.width;
+    if (tool === 'marker') base *= 1.5;
+    else if (tool === 'pencil') base *= 0.7;
+    else if (tool === 'highlighter') base *= 3;
+    const min = tool === 'highlighter' ? 0.8 : SETTINGS.pressureMin;
+    return base * (min + (1 - min) * p);
   }
 
-  // 三点加权平滑(1:2:1),轻去抖;点数 < 3 原样返回
   function smoothStroke(pts) {
     if (pts.length < 3) return pts;
     const out = [pts[0]];
     for (let i = 1; i < pts.length - 1; i++) {
       const a = pts[i - 1], b = pts[i], c = pts[i + 1];
-      out.push({
-        x: (a.x + 2 * b.x + c.x) / 4,
-        y: (a.y + 2 * b.y + c.y) / 4,
-        p: (a.p + 2 * b.p + c.p) / 4,
-      });
+      out.push({ x: (a.x + 2 * b.x + c.x) / 4, y: (a.y + 2 * b.y + c.y) / 4, p: (a.p + 2 * b.p + c.p) / 4 });
     }
     out.push(pts[pts.length - 1]);
     return out;
   }
 
-  // 逐段变宽圆帽描边;单点 = 轻点画圆
-  function drawStroke(ctx, stroke) {
-    const pts = smoothStroke(stroke.points);
-    if (!pts.length) return;
-    ctx.strokeStyle = stroke.color;
-    ctx.fillStyle = stroke.color;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    if (pts.length === 1) {
-      ctx.beginPath();
-      ctx.arc(pts[0].x, pts[0].y, widthFor(stroke, pts[0]) / 2, 0, Math.PI * 2);
-      ctx.fill();
-      return;
-    }
+  function drawArrowHead(ctx, a, b, width) {
+    const ang = Math.atan2(b.y - a.y, b.x - a.x);
+    const len = 8 + width;
+    const hw = 4 + width * 0.6;
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(ang);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-len, -hw);
+    ctx.lineTo(-len, hw);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPolyline(ctx, pts, stroke, mult, alphaMult) {
+    const outer = ctx.globalAlpha;
+    ctx.globalAlpha = outer * alphaMult;
     for (let i = 1; i < pts.length; i++) {
       const a = pts[i - 1], b = pts[i];
-      ctx.lineWidth = (widthFor(stroke, a) + widthFor(stroke, b)) / 2;
+      ctx.lineWidth = (brushWidthFor(stroke, a) + brushWidthFor(stroke, b)) / 2 * mult;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
     }
+    ctx.globalAlpha = outer;
   }
 
-  // ── 渲染器 ─────────────────────────────────────────────────
-  // 静态层(全页画布):absolute 定位在文档流顶部,随页面原生滚动 → 滚动零错位。
-  // 实时层(视口画布):fixed 覆盖视口,只在画的过程中叠加活动笔画,提交后清空。
+  // 核心渲染:按 tool 分支
+  function drawStroke(ctx, stroke) {
+    if (!stroke) return;
+    const tool = stroke.tool || 'pen';
+    const alpha = (typeof stroke.opacity === 'number' ? stroke.opacity : 1) * (tool === 'highlighter' ? 0.5 : 1);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = stroke.color;
+    ctx.strokeStyle = stroke.color;
+
+    // 文字
+    if (tool === 'text') {
+      const pt = stroke.points && stroke.points[0];
+      if (pt && stroke.text) {
+        ctx.font = 'normal ' + stroke.fontSize + 'px system-ui, "Segoe UI", "Microsoft YaHei", sans-serif';
+        ctx.textBaseline = 'alphabetic';
+        ctx.textAlign = 'left';
+        const lines = String(stroke.text).split('\n');
+        const lh = stroke.fontSize * 1.3;
+        lines.forEach((ln, i) => ctx.fillText(ln, pt.x, pt.y + stroke.fontSize + i * lh));
+      }
+      ctx.restore();
+      return;
+    }
+
+    const pts = stroke.points;
+    if (!pts || !pts.length) { ctx.restore(); return; }
+
+    // 图形(两点)
+    if (IS_SHAPE(tool)) {
+      const a = pts[0], b = pts[pts.length - 1];
+      if (!a || !b) { ctx.restore(); return; }
+      ctx.lineWidth = stroke.width;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      if (tool === 'line') {
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      } else if (tool === 'arrow') {
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        drawArrowHead(ctx, a, b, stroke.width);
+      } else if (tool === 'rect') {
+        const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+        ctx.strokeRect(x, y, Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+      } else if (tool === 'ellipse') {
+        ctx.ellipse((a.x + b.x) / 2, (a.y + b.y) / 2, Math.abs(b.x - a.x) / 2, Math.abs(b.y - a.y) / 2, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+      return;
+    }
+
+    // 笔刷
+    const smoothed = smoothStroke(pts);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = (tool === 'marker' || tool === 'highlighter') ? 'butt' : 'round';
+    if (smoothed.length === 1) {
+      const r = brushWidthFor(stroke, smoothed[0]) / 2;
+      ctx.beginPath();
+      ctx.arc(smoothed[0].x, smoothed[0].y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+    if (tool === 'neon') {
+      drawPolyline(ctx, smoothed, stroke, 2.2, 0.25);
+      drawPolyline(ctx, smoothed, stroke, 1.4, 0.5);
+      drawPolyline(ctx, smoothed, stroke, 1, 1);
+    } else {
+      drawPolyline(ctx, smoothed, stroke, 1, 1);
+    }
+    ctx.restore();
+  }
+
+  // ── 橡皮擦(段级) ───────────────────────────────────────────
+  function eraserRadius() { return Math.max(4, SETTINGS.width / 2); }
+
+  // 对 Store.strokes 应用擦除,返回 {strokes, changed}
+  function eraseStrokes(strokes, path, radius) {
+    if (!path.length) return { strokes: strokes, changed: false };
+    const erBBox = bboxOfPoints(path);
+    const out = [];
+    let changed = false;
+
+    for (const st of strokes) {
+      const tool = st.tool || 'pen';
+
+      // 文字:锚点命中即整条删除
+      if (tool === 'text') {
+        if (distToPath(st.points[0], path) <= radius) { changed = true; continue; }
+        out.push(st);
+        continue;
+      }
+
+      // 图形:关键点命中即整条删除
+      if (IS_SHAPE(tool)) {
+        const a = st.points[0], b = st.points[st.points.length - 1];
+        const keyPts = (tool === 'line' || tool === 'arrow')
+          ? [a, b]
+          : [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }];
+        let hit = false;
+        for (const p of keyPts) { if (distToPath(p, path) <= radius) { hit = true; break; } }
+        if (hit) { changed = true; continue; }
+        out.push(st);
+        continue;
+      }
+
+      // 笔刷:bbox 粗筛
+      const stBBox = bboxOfPoints(st.points);
+      if (!bboxIntersects(stBBox, erBBox)) { out.push(st); continue; }
+
+      // 逐点判定:点距橡皮路径 < r,或橡皮点落在某线段附近
+      const hits = new Array(st.points.length).fill(false);
+      for (let i = 0; i < st.points.length; i++) {
+        if (distToPath(st.points[i], path) <= radius) hits[i] = true;
+      }
+      for (const ep of path) {
+        for (let i = 0; i < st.points.length - 1; i++) {
+          if (distPointToSegment(ep, st.points[i], st.points[i + 1]) <= radius) { hits[i] = true; hits[i + 1] = true; }
+        }
+      }
+      if (!hits.some(Boolean)) { out.push(st); continue; }
+      if (hits.every(Boolean)) { changed = true; continue; }   // 整条被擦
+      changed = true;
+      let run = [];
+      for (let i = 0; i < st.points.length; i++) {
+        if (!hits[i]) run.push(st.points[i]);
+        else if (run.length) {
+          out.push(makeSubStroke(st, run));
+          run = [];
+        }
+      }
+      if (run.length) out.push(makeSubStroke(st, run));
+    }
+    return { strokes: out, changed: changed };
+  }
+
+  function makeSubStroke(st, pts) {
+    return Object.assign({}, st, { id: ++Input._uid, points: pts });
+  }
+
+  // ── 渲染器(双 canvas) ─────────────────────────────────────
   const Renderer = {
-    canvas: null,          // 实时层(视口)
-    staticCanvas: null,    // 静态层(全页)
-    ctx: null, staticCtx: null,
+    canvas: null, staticCanvas: null, ctx: null, staticCtx: null,
     _size: { w: 0, h: 0, dpr: 1, eff: 1 },
-    liveRaf: 0,
+    liveRaf: 0, eraseRaf: 0,
 
     init() {
-      // 静态层:文档流,由浏览器与网页内容一起滚动
       this.staticCanvas = document.createElement('canvas');
+      this.staticCanvas.id = 'dw-static-canvas';
       this.staticCtx = this.staticCanvas.getContext('2d');
       Object.assign(this.staticCanvas.style, {
-        position: 'absolute',
-        left: '0', top: '0',
-        pointerEvents: 'none',
-        zIndex: String(Z_INDEX - 1),
+        position: 'absolute', left: '0', top: '0',
+        pointerEvents: 'none', zIndex: String(Z_INDEX - 1),
       });
       (document.body || document.documentElement).appendChild(this.staticCanvas);
 
-      // 实时层:视口固定,叠加进行中的笔画
       this.canvas = document.createElement('canvas');
       this.canvas.id = 'dw-canvas';
       this.ctx = this.canvas.getContext('2d');
       Object.assign(this.canvas.style, {
-        position: 'fixed',
-        left: '0', top: '0',
-        pointerEvents: 'none',
-        zIndex: String(Z_INDEX - 1),
+        position: 'fixed', left: '0', top: '0',
+        pointerEvents: 'none', zIndex: String(Z_INDEX - 1),
       });
       root.appendChild(this.canvas);
 
-      // 静态层在文档流中,滚动无需重绘;滚动只需让实时层跟随(有活动笔画时)
       this._hScroll = () => { if (Input.activePointers.size) this.requestLive(); };
       this._hResize = () => { this._checkSize(); this.presentLive(); };
       this._hVV = () => this.presentLive();
@@ -188,10 +391,8 @@
         window.visualViewport.addEventListener('scroll', this._hVV);
       }
 
-      // 页面尺寸轮询(SPA 动态加载 / 懒加载图片撑高页面 / 缩放),变化才重绘
       this._checkSize();
       this._sizeTimer = setInterval(() => this._checkSize(), 500);
-
       this.presentLive();
     },
 
@@ -240,19 +441,20 @@
       this.redrawStatic();
     },
 
-    redrawStatic() {
-      if (!this.staticCtx) return;
+    redrawStaticWith(strokes) {
+      if (!this.staticCanvas) return;
       const s = this._size;
       const ctx = this.staticCtx;
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, this.staticCanvas.width, this.staticCanvas.height);
       ctx.restore();
-      ctx.setTransform(s.eff, 0, 0, s.eff, 0, 0);   // 页面坐标 × eff → 设备像素
-      for (const stroke of Store.strokes) drawStroke(ctx, stroke);
+      ctx.setTransform(s.eff, 0, 0, s.eff, 0, 0);
+      if (SETTINGS.showDrafts) for (const st of strokes) drawStroke(ctx, st);
     },
 
-    // 实时层渲染:清屏后在视口偏移下重画全部活动笔画
+    redrawStatic() { this.redrawStaticWith(Store.strokes); },
+
     presentLive() {
       if (!this.canvas) return;
       const vw = window.innerWidth, vh = window.innerHeight;
@@ -269,7 +471,24 @@
       ctx.clearRect(0, 0, bw, bh);
       if (!Input.activePointers.size) return;
       ctx.setTransform(dpr, 0, 0, dpr, -window.scrollX * dpr, -window.scrollY * dpr);
-      for (const [, s] of Input.activePointers) drawStroke(ctx, s);
+
+      if (SETTINGS.showDrafts) {
+        for (const [, s] of Input.activePointers) {
+          if (s.mode !== 'eraser') drawStroke(ctx, s);
+        }
+      }
+      // 橡皮光标轨迹
+      for (const [, s] of Input.activePointers) {
+        if (s.mode !== 'eraser') continue;
+        ctx.globalAlpha = 0.3;
+        ctx.fillStyle = '#666';
+        for (const p of s.points) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, s.radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
     },
 
     requestLive() {
@@ -280,9 +499,27 @@
       });
     },
 
-    // 提交完成的笔画 → 画进全页静态层(页面坐标),清实时层
+    requestErasePreview() {
+      if (this.eraseRaf) return;
+      this.eraseRaf = requestAnimationFrame(() => {
+        this.eraseRaf = 0;
+        const erasers = [...Input.activePointers.values()].filter((s) => s.mode === 'eraser');
+        if (!erasers.length) { this.presentLive(); return; }
+        const path = [];
+        let radius = 0;
+        for (const er of erasers) {
+          for (const p of er.points) path.push(p);
+          if (er.radius > radius) radius = er.radius;
+        }
+        const preview = eraseStrokes(Store.strokes, path, radius);
+        this.redrawStaticWith(preview.strokes);
+        this.presentLive();
+      });
+    },
+
+    // 提交完成的笔画:入历史 + 增量画进静态层
     commitStroke(stroke) {
-      Store.add(stroke);
+      Store.commitChange(Store.strokes, Store.strokes.concat([stroke]));
       const ctx = this.staticCtx;
       if (ctx) {
         ctx.setTransform(this._size.eff, 0, 0, this._size.eff, 0, 0);
@@ -292,7 +529,7 @@
     },
   };
 
-  // ── 输入分流(document capture;画布 pointer-events:none) ────
+  // ── 输入分流(document capture) ─────────────────────────────
   const Input = {
     activePointers: new Map(),
     _uid: 0,
@@ -321,47 +558,97 @@
 
     isToolbarTarget(t) { return !!(t && t.closest && t.closest('#draw-root')); },
 
-    onDown(e) {
-      if (this.isToolbarTarget(e.target)) return;   // 工具栏自处理,不起笔画
+    _isDrawPointer(e) {
       const t = e.pointerType;
-      const isPen = t === 'pen' || t === 'eraser';
-      const isMouseDraw = t === 'mouse' && SETTINGS.drawWithMouse;
-      if (!isPen && !isMouseDraw) return;           // touch / mouse(放行)→ 什么都不做,页面照常滚动
-      if (!(e.buttons & 1)) return;                 // 悬空 / 非主键按下 → 不算落笔
-      e.preventDefault();                           // 阻止默认动作(选字/聚焦);注意:不靠它挡滚动
-      if (isPen) this.lockPen();                    // 笔画期间冻结整页 panning
-      this.activePointers.set(e.pointerId, {
+      return t === 'pen' || t === 'eraser' || (t === 'mouse' && SETTINGS.drawWithMouse);
+    },
+
+    onDown(e) {
+      if (this.isToolbarTarget(e.target)) return;   // 工具栏自处理
+      Editor.commit();                              // 先落定正在输入的文字
+      if (!this._isDrawPointer(e)) return;          // touch / mouse(放行)
+      if (!(e.buttons & 1)) return;
+
+      const tool = SETTINGS.tool;
+      e.preventDefault();
+      if (tool === 'text') {
+        if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.lockPen();
+        Editor.open(e.clientX, e.clientY);
+        if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.unlockPen();
+        return;
+      }
+      if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.lockPen();
+
+      if (tool === 'eraser') {
+        this.activePointers.set(e.pointerId, {
+          mode: 'eraser',
+          points: [Coord.toPage(e)],
+          radius: eraserRadius(),
+          penLocked: e.pointerType === 'pen' || e.pointerType === 'eraser',
+        });
+        Renderer.requestLive();
+        return;
+      }
+
+      const st = {
         id: ++this._uid,
+        tool: tool,
         color: SETTINGS.color,
         width: SETTINGS.width,
-        pointerType: t,
+        opacity: SETTINGS.opacity,
+        pointerType: e.pointerType,
         points: [pointFromEvent(e)],
-      });
+      };
+      if (IS_SHAPE(tool)) st.points.push(pointFromEvent(e));   // 图形第二点,后续 move 覆盖
+      this.activePointers.set(e.pointerId, st);
       Renderer.requestLive();
     },
 
     onMove(e) {
-      const stroke = this.activePointers.get(e.pointerId);
-      if (!stroke) return;                          // 无进行中笔画
-      // 数位板 200Hz+ 采样,Chrome 只派发合并后的 move → 先取回全部采样再判断
-      const samples = (e.getCoalescedEvents && e.pointerType === 'pen')
-        ? e.getCoalescedEvents()
-        : [e];
+      const st = this.activePointers.get(e.pointerId);
+      if (!st) return;
+
+      // 橡皮擦
+      if (st.mode === 'eraser') {
+        if (!(e.buttons & 1)) { this.endStroke(e.pointerId); if (st.penLocked) this.unlockPen(); return; }
+        const samples = (e.getCoalescedEvents && e.pointerType === 'pen') ? e.getCoalescedEvents() : [e];
+        for (const s of samples) {
+          if (!(s.buttons & 1)) continue;
+          const pt = Coord.toPage(s);
+          const last = st.points[st.points.length - 1];
+          if (last && Coord.dist(pt, last) < MIN_DIST) continue;
+          st.points.push(pt);
+        }
+        e.preventDefault();
+        Renderer.requestErasePreview();
+        return;
+      }
+
+      // 图形:只更新终点
+      if (IS_SHAPE(st.tool)) {
+        if (!(e.buttons & 1)) { this.endStroke(e.pointerId); return; }
+        st.points[1] = pointFromEvent(e);
+        e.preventDefault();
+        Renderer.requestLive();
+        return;
+      }
+
+      // 笔刷:追加采样
+      const samples = (e.getCoalescedEvents && e.pointerType === 'pen') ? e.getCoalescedEvents() : [e];
       let hadContact = false;
       for (const s of samples) {
         if (!(s.buttons & 1)) continue;
         hadContact = true;
         const pt = pointFromEvent(s);
-        const last = stroke.points[stroke.points.length - 1];
+        const last = st.points[st.points.length - 1];
         if (last && Coord.dist(pt, last) < MIN_DIST) continue;
-        stroke.points.push(pt);
-        if (stroke.points.length >= MAX_POINTS) break;
+        st.points.push(pt);
+        if (st.points.length >= MAX_POINTS) break;
       }
       if (hadContact) {
         e.preventDefault();
         Renderer.requestLive();
       } else if (!(e.buttons & 1)) {
-        // 已抬笔但没收到 pointerup(个别设备/系统):按抬笔保险收尾
         this.endStroke(e.pointerId);
         if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.unlockPen();
       }
@@ -373,16 +660,35 @@
     },
 
     onCancel(e) {
-      this.endStroke(e.pointerId);                  // 系统打断:保留已画部分
+      this.endStroke(e.pointerId);
       if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.unlockPen();
     },
 
     endStroke(pointerId) {
-      const stroke = this.activePointers.get(pointerId);
+      const st = this.activePointers.get(pointerId);
       this.activePointers.delete(pointerId);
-      if (!stroke) return;
-      if (stroke.points.length) Renderer.commitStroke(stroke);
-      else Renderer.requestLive();                  // 空笔画,清掉可能的实时残影
+      if (!st) return;
+
+      if (st.mode === 'eraser') {
+        this.finishErase(st);
+        return;
+      }
+      if (IS_SHAPE(st.tool)) {   // 图形没拖出有效第二点 → 丢弃
+        if (st.points.length < 2 || Coord.dist(st.points[0], st.points[1]) < 1) {
+          Renderer.presentLive();
+          return;
+        }
+      }
+      if (st.points.length) Renderer.commitStroke(st);
+      else Renderer.requestLive();
+    },
+
+    finishErase(eraserSt) {
+      if (!eraserSt.points.length) { Renderer.presentLive(); return; }
+      const res = eraseStrokes(Store.strokes, eraserSt.points, eraserSt.radius);
+      if (res.changed) Store.commitChange(Store.strokes, res.strokes);
+      Renderer.redrawStatic();
+      Renderer.presentLive();
     },
 
     lockPen() {
@@ -397,21 +703,204 @@
 
   function pointFromEvent(ev) {
     const pg = Coord.toPage(ev);
-    // 鼠标无压力,取满宽;pen 的 pressure 0~1(8192 级压感归一)
     let p = ev.pointerType === 'mouse' ? 1 : (typeof ev.pressure === 'number' ? ev.pressure : 1);
     if (!(p > 0)) p = 1;
-    return {
-      x: pg.x,
-      y: pg.y,
-      p: p,
-      tilt: [ev.tiltX || 0, ev.tiltY || 0],
-    };
+    return { x: pg.x, y: pg.y, p: p, tilt: [ev.tiltX || 0, ev.tiltY || 0] };
+  }
+
+  // ── 文字编辑器 ─────────────────────────────────────────────
+  const Editor = {
+    el: null,
+    open(clientX, clientY) {
+      this.commit();
+      if (this.el) this.cancel();
+      this.el = document.createElement('textarea');
+      this.el.className = 'dw-text-editor';
+      this.el.style.left = clientX + 'px';
+      this.el.style.top = clientY + 'px';
+      this.el.style.fontSize = SETTINGS.width + 'px';
+      this.el.style.color = SETTINGS.color;
+      root.appendChild(this.el);
+      this.el.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.commit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); this.cancel(); }
+      });
+      this.el.addEventListener('blur', () => this.commit());
+      this.el.focus();
+    },
+    commit() {
+      if (!this.el) return;
+      const text = this.el.value.trim();
+      const rect = this.el.getBoundingClientRect();
+      const stroke = {
+        id: ++Input._uid,
+        tool: 'text',
+        text: text,
+        fontSize: SETTINGS.width,
+        color: SETTINGS.color,
+        opacity: SETTINGS.opacity,
+        pointerType: 'text',
+        points: [{ x: rect.left + window.scrollX, y: rect.top + window.scrollY, p: 1, tilt: [0, 0] }],
+      };
+      if (text) Renderer.commitStroke(stroke);
+      else Renderer.presentLive();
+      this.cancel();
+    },
+    cancel() {
+      if (this.el) {
+        this.el.remove();
+        this.el = null;
+      }
+    },
+    get isOpen() { return !!this.el; },
+  };
+
+  // ── 持久化(自动保存/恢复) ─────────────────────────────────
+  const Persist = {
+    key: '',
+    timer: 0,
+    init() {
+      const base = location.origin + location.pathname + location.search;
+      this.key = 'dw:drafts:' + hashStr(base);
+      Store.onChange = () => this.scheduleSave();
+      this.restore();
+    },
+    restore() {
+      try {
+        const raw = localStorage.getItem(this.key);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+        if (data && data.v === 1 && Array.isArray(data.strokes)) {
+          for (const s of data.strokes) s.id = ++Input._uid;
+          Store.strokes = data.strokes;
+          Renderer.redrawStatic();
+        }
+      } catch (err) { /* 数据损坏 / 无痕模式:忽略 */ }
+    },
+    scheduleSave() {
+      if (!SETTINGS.autoSave) return;
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => this.save(), 300);
+    },
+    save() {
+      if (!SETTINGS.autoSave) return;
+      try {
+        localStorage.setItem(this.key, JSON.stringify({ v: 1, strokes: Store.strokes }));
+      } catch (err) {
+        toast('自动保存失败:本地存储空间不足,已关闭自动保存');
+        SETTINGS.autoSave = false;
+        Toolbar.syncAutoSave();
+      }
+    },
+    clear() {
+      try { localStorage.removeItem(this.key); } catch (err) { /* noop */ }
+    },
+    destroy() {
+      clearTimeout(this.timer);
+      Store.onChange = null;
+    },
+  };
+
+  // ── 导出 ───────────────────────────────────────────────────
+  const Export = {
+    _busy: false,
+    async run() {
+      if (this._busy) return;
+      this._busy = true;
+      Editor.commit();
+      try {
+        let done = false;
+        try { done = await this.composite(); }
+        catch (err) {
+          console.warn('[WebDraw] 合成导出失败,退回纯草稿:', err);
+        }
+        if (!done) this.draftOnly();
+      } finally {
+        this._busy = false;
+      }
+    },
+
+    filename() {
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const ts = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+      const host = (location.hostname || 'page').replace(/[^\w.-]/g, '_');
+      return 'webdraw-' + host + '-' + ts + '.png';
+    },
+
+    async composite() {
+      if (!(await ensureHtml2canvas())) return false;
+      const se = document.scrollingElement || document.documentElement;
+      const w = Math.max(se.scrollWidth, window.innerWidth);
+      const h = Math.max(se.scrollHeight, window.innerHeight);
+      const dpr = window.devicePixelRatio || 1;
+      const scale = (w * h > 12e6) ? 1 : Math.min(dpr, 2);
+
+      const canvas = await window.html2canvas(document.body, {
+        width: w,
+        height: h,
+        windowWidth: window.innerWidth,
+        windowHeight: window.innerHeight,
+        scale: scale,
+        backgroundColor: null,
+        useCORS: true,
+        logging: false,
+        onclone: (doc) => {
+          const el = doc.getElementById('dw-static-canvas');
+          if (el) el.style.display = 'none';
+        },
+      });
+
+      const ctx = canvas.getContext('2d');
+      ctx.setTransform(scale, 0, 0, scale, 0, 0);
+      if (SETTINGS.showDrafts) for (const s of Store.strokes) drawStroke(ctx, s);
+      downloadCanvas(canvas, this.filename());
+      return true;
+    },
+
+    draftOnly() {
+      const se = document.scrollingElement || document.documentElement;
+      const w = Math.max(se.scrollWidth, window.innerWidth);
+      const h = Math.max(se.scrollHeight, window.innerHeight);
+      const eff = computeEffDpr(w, h, window.devicePixelRatio || 1);
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(w * eff));
+      c.height = Math.max(1, Math.round(h * eff));
+      const ctx = c.getContext('2d');
+      ctx.setTransform(eff, 0, 0, eff, 0, 0);
+      if (SETTINGS.showDrafts) for (const s of Store.strokes) drawStroke(ctx, s);
+      downloadCanvas(c, this.filename());
+    },
+  };
+
+  function downloadCanvas(canvas, name) {
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = name;
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  async function ensureHtml2canvas() {
+    if (window.html2canvas) return true;
+    try {
+      if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.sendMessage) return false;
+      const res = await chrome.runtime.sendMessage({ type: 'dw:inject-lib' });
+      if (!res || !res.ok) return false;
+      await new Promise((r) => setTimeout(r, 50));
+      return !!window.html2canvas;
+    } catch (err) {
+      return false;
+    }
   }
 
   // ── 浮动工具栏 ─────────────────────────────────────────────
   const Toolbar = {
     el: null,
     _fadeTimer: 0,
+    _els: {},
 
     init() {
       this.el = document.createElement('div');
@@ -420,67 +909,99 @@
         '<div id="dw-drag"><span>🖌 Web Draw</span>' +
         '<button id="dw-min" title="收起/展开">–</button></div>' +
         '<div class="dw-body">' +
-          '<div class="dw-row dw-swatches"></div>' +
-          '<div class="dw-row dw-size-row">' +
-            '<input id="dw-size" type="range" min="2" max="20" step="1" value="' + SETTINGS.width + '">' +
-            '<span class="dw-size-value" id="dw-size-value">' + SETTINGS.width + '</span>' +
+          '<div class="dw-sec dw-tools"></div>' +
+          '<div class="dw-sec dw-styles">' +
+            '<div class="dw-row dw-swatches"></div>' +
+            '<div class="dw-row dw-size-row">' +
+              '<span class="dw-label" id="dw-size-label">粗细</span>' +
+              '<input id="dw-size" type="range" min="1" max="40" step="1">' +
+              '<span class="dw-size-value" id="dw-size-value">4</span>' +
+            '</div>' +
+            '<div class="dw-row dw-size-row">' +
+              '<span class="dw-label">透明度</span>' +
+              '<input id="dw-opacity" type="range" min="5" max="100" step="1">' +
+              '<span class="dw-size-value" id="dw-opacity-value">100%</span>' +
+            '</div>' +
           '</div>' +
-          '<div class="dw-row dw-btns">' +
-            '<button id="dw-undo">撤销</button>' +
-            '<button id="dw-clear">清空</button>' +
-            '<button id="dw-mouse" title="用鼠标画画(默认关闭,鼠标保持正常滚动/点选)">🖱 鼠标画</button>' +
-            '<button id="dw-exit">退出</button>' +
+          '<div class="dw-sec">' +
+            '<div class="dw-row dw-btns">' +
+              '<button id="dw-undo" title="撤销 Ctrl+Z">撤销</button>' +
+              '<button id="dw-clear" title="清空全部草稿">清空</button>' +
+            '</div>' +
+            '<div class="dw-row dw-btns">' +
+              '<button id="dw-hide" title="隐藏/显示草稿 H">隐藏</button>' +
+              '<button id="dw-export" title="导出截图 Ctrl+S">导出</button>' +
+              '<button id="dw-mouse" title="用鼠标画画(默认关闭)">🖱 鼠标</button>' +
+              '<button id="dw-exit" title="退出 Esc">退出</button>' +
+            '</div>' +
           '</div>' +
+          '<details class="dw-sec dw-settings">' +
+            '<summary>⚙ 设置</summary>' +
+            '<div class="dw-row dw-size-row">' +
+              '<span class="dw-label">压感曲线</span>' +
+              '<input id="dw-pexp" type="range" min="30" max="150" step="5">' +
+              '<span class="dw-size-value" id="dw-pexp-value">0.70</span>' +
+            '</div>' +
+            '<div class="dw-row dw-size-row">' +
+              '<span class="dw-label">最小线宽</span>' +
+              '<input id="dw-pmin" type="range" min="0" max="40" step="1">' +
+              '<span class="dw-size-value" id="dw-pmin-value">15%</span>' +
+            '</div>' +
+            '<div class="dw-row dw-opt">' +
+              '<label><input id="dw-autosave" type="checkbox" checked> 自动保存草稿</label>' +
+            '</div>' +
+          '</details>' +
         '</div>';
       root.appendChild(this.el);
 
-      // 色板
-      const swRow = this.el.querySelector('.dw-swatches');
-      SWATCHES.forEach((c) => {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'dw-swatch';
-        b.style.background = c;
-        b.dataset.color = c;
-        b.title = c;
-        b.addEventListener('pointerdown', (e) => e.stopPropagation());
-        b.addEventListener('click', () => this.setColor(c));
-        swRow.appendChild(b);
-      });
-      const custom = document.createElement('input');
-      custom.type = 'color';
-      custom.className = 'dw-custom-color';
-      custom.title = '自定义颜色';
-      custom.value = SETTINGS.color;
-      custom.addEventListener('pointerdown', (e) => e.stopPropagation());
-      custom.addEventListener('input', () => this.setColor(custom.value));
-      swRow.appendChild(custom);
-
-      // 粗细
-      const sizeEl = this.el.querySelector('#dw-size');
-      const sizeVal = this.el.querySelector('#dw-size-value');
-      sizeEl.addEventListener('input', () => {
-        SETTINGS.width = parseInt(sizeEl.value, 10);
-        sizeVal.textContent = SETTINGS.width;
-      });
-
-      // 功能按钮
-      this.el.querySelector('#dw-undo').addEventListener('click', (e) => { e.stopPropagation(); App.undo(); });
-      this.el.querySelector('#dw-clear').addEventListener('click', (e) => { e.stopPropagation(); App.clear(); });
-      this.el.querySelector('#dw-exit').addEventListener('click', (e) => { e.stopPropagation(); App.exit(); });
-
-      const mouseBtn = this.el.querySelector('#dw-mouse');
-      const syncMouse = () => {
-        mouseBtn.classList.toggle('dw-active', SETTINGS.drawWithMouse);
-        mouseBtn.textContent = SETTINGS.drawWithMouse ? '🖱 鼠标画:开' : '🖱 鼠标画';
+      this._els = {
+        tools: this.el.querySelector('.dw-tools'),
+        size: this.el.querySelector('#dw-size'),
+        sizeValue: this.el.querySelector('#dw-size-value'),
+        sizeLabel: this.el.querySelector('#dw-size-label'),
+        opacity: this.el.querySelector('#dw-opacity'),
+        opacityValue: this.el.querySelector('#dw-opacity-value'),
+        pexp: this.el.querySelector('#dw-pexp'),
+        pexpValue: this.el.querySelector('#dw-pexp-value'),
+        pmin: this.el.querySelector('#dw-pmin'),
+        pminValue: this.el.querySelector('#dw-pmin-value'),
+        autosave: this.el.querySelector('#dw-autosave'),
+        hide: this.el.querySelector('#dw-hide'),
       };
-      mouseBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        SETTINGS.drawWithMouse = !SETTINGS.drawWithMouse;
-        syncMouse();
-      });
-      syncMouse();
 
+      this._buildTools();
+      this._buildSwatches();
+
+      this._els.size.addEventListener('input', () => {
+        SETTINGS.width = parseInt(this._els.size.value, 10);
+        this._els.sizeValue.textContent = SETTINGS.width;
+      });
+      this._els.opacity.addEventListener('input', () => {
+        SETTINGS.opacity = parseInt(this._els.opacity.value, 10) / 100;
+        this._els.opacityValue.textContent = this._els.opacity.value + '%';
+      });
+      this._els.pexp.addEventListener('input', () => {
+        SETTINGS.pressureExp = parseInt(this._els.pexp.value, 10) / 100;
+        this._els.pexpValue.textContent = (SETTINGS.pressureExp).toFixed(2);
+      });
+      this._els.pmin.addEventListener('input', () => {
+        SETTINGS.pressureMin = parseInt(this._els.pmin.value, 10) / 100;
+        this._els.pminValue.textContent = this._els.pmin.value + '%';
+      });
+      this._els.autosave.addEventListener('change', () => {
+        SETTINGS.autoSave = this._els.autosave.checked;
+        if (!SETTINGS.autoSave) Persist.clear();
+      });
+
+      const bind = (id, fn) => {
+        this.el.querySelector('#' + id).addEventListener('click', (e) => { e.stopPropagation(); fn(); });
+      };
+      bind('dw-undo', () => App.undo());
+      bind('dw-clear', () => App.clear());
+      bind('dw-hide', () => App.toggleHide());
+      bind('dw-export', () => Export.run());
+      bind('dw-exit', () => App.exit());
+      bind('dw-mouse', () => { SETTINGS.drawWithMouse = !SETTINGS.drawWithMouse; this.sync(); });
       this.el.querySelector('#dw-min').addEventListener('click', (e) => {
         e.stopPropagation();
         this.el.classList.toggle('dw-collapsed');
@@ -488,7 +1009,6 @@
 
       initDrag(this.el);
 
-      // 3s 无操作自动淡化成半透明,悬停/移动恢复
       this._hWake = () => {
         this.el.classList.remove('dw-faded');
         clearTimeout(this._fadeTimer);
@@ -498,7 +1018,82 @@
       this.el.addEventListener('pointermove', this._hWake);
       this._fadeTimer = setTimeout(() => this.el.classList.add('dw-faded'), 3000);
 
+      this.sync();
+    },
+
+    _buildTools() {
+      TOOL_ORDER.forEach((t) => {
+        const def = TOOL_DEFS[t];
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'dw-tool';
+        b.dataset.tool = t;
+        b.innerHTML = '<span class="dw-tool-icon">' + def.icon + '</span><span class="dw-tool-name">' + def.name + '</span>';
+        b.title = def.name + (def.shortcut ? ' (' + def.shortcut + ')' : '');
+        b.addEventListener('pointerdown', (e) => e.stopPropagation());
+        b.addEventListener('click', () => App.selectTool(t));
+        this._els.tools.appendChild(b);
+      });
+    },
+
+    _buildSwatches() {
+      const row = this.el.querySelector('.dw-swatches');
+      SWATCHES.forEach((c) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'dw-swatch';
+        b.style.background = c;
+        b.dataset.color = c;
+        b.title = c;
+        b.addEventListener('pointerdown', (e) => e.stopPropagation());
+        b.addEventListener('click', () => App.setColor(c));
+        row.appendChild(b);
+      });
+      const custom = document.createElement('input');
+      custom.type = 'color';
+      custom.className = 'dw-custom-color';
+      custom.title = '自定义颜色';
+      custom.value = SETTINGS.color;
+      custom.addEventListener('pointerdown', (e) => e.stopPropagation());
+      custom.addEventListener('input', () => App.setColor(custom.value));
+      row.appendChild(custom);
+    },
+
+    // 从 SETTINGS 同步全部控件
+    sync() {
+      const def = TOOL_DEFS[SETTINGS.tool];
+      // 工具按钮激活态
+      this._els.tools.querySelectorAll('.dw-tool').forEach((b) => {
+        b.classList.toggle('dw-active', b.dataset.tool === SETTINGS.tool);
+      });
+      // 粗细滑杆范围/标签
+      this._els.size.min = def.wMin;
+      this._els.size.max = def.wMax;
+      SETTINGS.width = clamp(SETTINGS.width, def.wMin, def.wMax);
+      this._els.size.value = SETTINGS.width;
+      this._els.sizeValue.textContent = SETTINGS.width;
+      this._els.sizeLabel.textContent = SIZE_LABELS[SETTINGS.tool];
+      // 透明度
+      this._els.opacity.value = Math.round(SETTINGS.opacity * 100);
+      this._els.opacityValue.textContent = this._els.opacity.value + '%';
+      // 压感
+      this._els.pexp.value = Math.round(SETTINGS.pressureExp * 100);
+      this._els.pexpValue.textContent = SETTINGS.pressureExp.toFixed(2);
+      this._els.pmin.value = Math.round(SETTINGS.pressureMin * 100);
+      this._els.pminValue.textContent = this._els.pmin.value + '%';
+      // 开关
+      this._els.autosave.checked = SETTINGS.autoSave;
+      const hide = this._els.hide;
+      hide.textContent = SETTINGS.showDrafts ? '隐藏' : '显示';
+      hide.classList.toggle('dw-active', !SETTINGS.showDrafts);
+      const mouse = this.el.querySelector('#dw-mouse');
+      mouse.textContent = SETTINGS.drawWithMouse ? '🖱 鼠标:开' : '🖱 鼠标';
+      mouse.classList.toggle('dw-active', SETTINGS.drawWithMouse);
       this.setColor(SETTINGS.color);
+    },
+
+    syncAutoSave() {
+      if (this._els.autosave) this._els.autosave.checked = SETTINGS.autoSave;
     },
 
     setColor(c) {
@@ -519,20 +1114,16 @@
     },
   };
 
-  // 工具栏拖动:按下即拖,期间在 window capture 阶段跟随,松开即停。
-  // 不使用 setPointerCapture —— 捕获会把 move/up 重定向到捕获元素本身,
-  // 挂在 header 上的 move/up 收不到事件,导致"停不下来"。
   function initDrag(toolbar) {
     const header = toolbar.querySelector('#dw-drag');
     let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
-
     const onMove = (e) => {
       if (!dragging) return;
       const dx = e.clientX - sx, dy = e.clientY - sy;
       const tw = toolbar.offsetWidth;
       const th = toolbar.offsetHeight;
-      const maxL = Math.max(0, window.innerWidth - Math.min(tw, 80)); // 至少留 80px 在屏内
-      const maxT = Math.max(0, window.innerHeight - 32);              // 标题栏不拖出屏幕
+      const maxL = Math.max(0, window.innerWidth - Math.min(tw, 80));
+      const maxT = Math.max(0, window.innerHeight - 32);
       toolbar.style.left = clamp(ox + dx, 0, maxL) + 'px';
       toolbar.style.top = clamp(oy + dy, 0, maxT) + 'px';
       toolbar.style.right = 'auto';
@@ -545,10 +1136,9 @@
       window.removeEventListener('pointerup', end, true);
       window.removeEventListener('pointercancel', end, true);
     };
-
     header.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('button')) return;   // 让最小化按钮点击正常走
-      if (e.button !== 0) return;               // 仅左键/笔尖
+      if (e.target.closest('button')) return;
+      if (e.button !== 0) return;
       dragging = true;
       sx = e.clientX;
       sy = e.clientY;
@@ -563,7 +1153,6 @@
     });
   }
 
-  // ── 轻提示 ─────────────────────────────────────────────────
   function toast(msg) {
     let el = root && root.querySelector('.dw-toast');
     if (!el && root) {
@@ -583,6 +1172,7 @@
 
   const App = {
     alive: false,
+    _prevTool: 'pen',
 
     init() {
       if (this.alive) return;
@@ -595,11 +1185,11 @@
       Toolbar.init();
       Renderer.init();
       Input.init();
+      Persist.init();
 
       this._hKey = (e) => this.keydown(e);
       document.addEventListener('keydown', this._hKey, true);
 
-      // 滚动结构检测:页面靠内层容器滚动(Notion 式)时,草稿无法跟随窗口滚动
       const se = document.scrollingElement || document.documentElement;
       if (se.scrollHeight <= window.innerHeight &&
           document.body && document.body.scrollHeight > window.innerHeight) {
@@ -613,8 +1203,10 @@
       if (!this.alive) return;
       this.alive = false;
       document.removeEventListener('keydown', this._hKey, true);
+      Editor.cancel();
       Input.destroy();
       Renderer.destroy();
+      Persist.destroy();
       Toolbar.destroy();
       if (root) {
         root.remove();
@@ -623,30 +1215,76 @@
       notify(false);
     },
 
+    selectTool(t) {
+      Editor.commit();
+      if (t === 'eraser' && SETTINGS.tool !== 'eraser') this._prevTool = SETTINGS.tool;
+      SETTINGS.tool = t;
+      Toolbar.sync();
+    },
+
+    setColor(c) {
+      Editor.commit();
+      Toolbar.setColor(c);
+    },
+
     undo() {
+      Editor.commit();
       if (Store.undo()) {
         Renderer.redrawStatic();
         Renderer.presentLive();
       }
     },
+
     clear() {
+      Editor.commit();
       if (Store.clear()) {
         Renderer.redrawStatic();
         Renderer.presentLive();
       }
     },
+
+    toggleHide() {
+      Editor.commit();
+      SETTINGS.showDrafts = !SETTINGS.showDrafts;
+      Renderer.redrawStatic();
+      Renderer.presentLive();
+      Toolbar.sync();
+    },
+
     exit() { this.destroy(); },
 
     keydown(e) {
-      if (isEditable(e.target)) return;                    // 输入框内不劫持
+      if (isEditable(e.target)) return;
+      const ctrl = e.ctrlKey || e.metaKey;
+
       if (e.key === 'Escape') {
         e.preventDefault();
         this.destroy();
-      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+      } else if (ctrl && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault();
-        e.stopPropagation();                               // 绘画模式下接管 Ctrl+Z 撤销
+        e.stopPropagation();
         this.undo();
-      }
+      } else if (ctrl && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        e.stopPropagation();
+        Export.run();
+      } else if (ctrl || e.altKey || e.metaKey) {
+        return;
+      } else if (e.key === 'b' || e.key === 'B') {
+        const i = BRUSH_TOOLS.indexOf(SETTINGS.tool);
+        const next = BRUSH_TOOLS[(i + 1) % BRUSH_TOOLS.length];
+        this.selectTool(next);
+      } else if (e.key === 'e' || e.key === 'E') {
+        this.selectTool(SETTINGS.tool === 'eraser' ? (this._prevTool || 'pen') : 'eraser');
+      } else if (e.key === 't' || e.key === 'T') {
+        this.selectTool('text');
+      } else if (e.key === 'l' || e.key === 'L') this.selectTool('line');
+      else if (e.key === 'a' || e.key === 'A') this.selectTool('arrow');
+      else if (e.key === 'r' || e.key === 'R') this.selectTool('rect');
+      else if (e.key === 'o' || e.key === 'O') this.selectTool('ellipse');
+      else if (e.key === 'h' || e.key === 'H') this.toggleHide();
+      else if (e.key === '[') { SETTINGS.width = clamp(SETTINGS.width - 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
+      else if (e.key === ']') { SETTINGS.width = clamp(SETTINGS.width + 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
     },
   };
 
@@ -658,11 +1296,11 @@
     } catch (err) { /* 非扩展环境忽略 */ }
   }
 
-  // ── 入口:幂等开关(点图标开/关) ────────────────────────────
+  // ── 入口:幂等开关 ──────────────────────────────────────────
   if (window.__dwInstance && window.__dwInstance.alive) {
-    window.__dwInstance.destroy();   // 已有实例 → 关闭
+    window.__dwInstance.destroy();
   } else {
-    window.__dwInstance = App;       // 无实例 → 开启
+    window.__dwInstance = App;
     App.init();
   }
 })();

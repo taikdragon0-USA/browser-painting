@@ -26,6 +26,7 @@ foreach ($f in @("manifest.json", "background.js", "content.js", "content.css", 
   Copy-Item (Join-Path $root $f) $staging
 }
 Copy-Item (Join-Path $root "icons") (Join-Path $staging "icons") -Recurse
+Copy-Item (Join-Path $root "lib") (Join-Path $staging "lib") -Recurse
 
 # 打包
 Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $zipPath

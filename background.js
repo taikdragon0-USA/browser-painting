@@ -23,14 +23,32 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 });
 
-// 接收 content script 的状态上报,更新该标签页徽标
-chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (!msg || msg.type !== 'dw:state') return;
-  if (!sender.tab) return;
-  if (msg.on) {
-    chrome.action.setBadgeText({ tabId: sender.tab.id, text: 'ON' });
-    chrome.action.setBadgeBackgroundColor({ tabId: sender.tab.id, color: '#2f7bff' });
-  } else {
-    chrome.action.setBadgeText({ tabId: sender.tab.id, text: '' });
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || !sender.tab) return;
+
+  // content script 状态上报 → 徽标
+  if (msg.type === 'dw:state') {
+    if (msg.on) {
+      chrome.action.setBadgeText({ tabId: sender.tab.id, text: 'ON' });
+      chrome.action.setBadgeBackgroundColor({ tabId: sender.tab.id, color: '#2f7bff' });
+    } else {
+      chrome.action.setBadgeText({ tabId: sender.tab.id, text: '' });
+    }
+    return;
+  }
+
+  // 导出截图时按需注入 html2canvas 到 content script 的隔离世界
+  // (扩展脚本注入不受页面 CSP 限制,也不跨 JS 世界)
+  if (msg.type === 'dw:inject-lib') {
+    chrome.scripting
+      .executeScript({
+        target: { tabId: sender.tab.id },
+        files: ['lib/html2canvas.min.js'],
+      })
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) =>
+        sendResponse({ ok: false, error: String((err && err.message) || err) })
+      );
+    return true; // 异步 sendResponse
   }
 });

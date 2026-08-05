@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Web Draw - 网页绘画",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "在任意网页之上用触控笔/鼠标画画,草稿跟随网页内容滚动。",
   "minimum_chrome_version": "88",
   "permissions": ["activeTab", "scripting"],
