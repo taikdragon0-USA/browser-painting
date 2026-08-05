@@ -1,0 +1,167 @@
+/* ============================================================
+   Web Draw — content styles
+   全部以 #draw-root 为作用域前缀,避免污染宿主页面。
+   html[data-dw-lock] 是触控笔笔画进行时的整页滚动锁(关键机制):
+   Pointer Events 下 preventDefault() 无法阻止滚动,只有 touch-action:none 能。
+   ============================================================ */
+
+/* 绘制根容器:覆盖整个布局视口,不拦截任何指针事件 */
+#draw-root {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+/* 触控笔落下瞬间由 content.js 给 <html> 加 data-dw-lock,冻结整页 panning;
+   抬笔即移除,不影响手指/滚轮的正常滚动 */
+html[data-dw-lock] {
+  touch-action: none !important;
+}
+
+/* 可见画布 */
+#draw-root #dw-canvas {
+  position: fixed;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+/* ── 浮动工具栏 ─────────────────────────────────────────── */
+#draw-root #dw-toolbar {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 2147483647;
+  pointer-events: auto;
+  user-select: none;
+  touch-action: none;
+  font: 13px/1.5 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: #222;
+  background: rgba(255, 255, 255, 0.97);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+  overflow: hidden;
+  transition: opacity 0.3s;
+  max-width: 220px;
+}
+#draw-root #dw-toolbar.dw-faded { opacity: 0.3; }
+#draw-root #dw-toolbar.dw-collapsed .dw-body { display: none; }
+
+#draw-root #dw-drag {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 6px 6px 12px;
+  cursor: grab;
+  background: linear-gradient(#fafafa, #f0f0f0);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  font-weight: 600;
+  font-size: 12px;
+  color: #444;
+  white-space: nowrap;
+}
+#draw-root #dw-toolbar.dw-collapsed #dw-drag { border-bottom: none; }
+#draw-root #dw-drag:active { cursor: grabbing; }
+
+#draw-root #dw-drag button {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: #666;
+}
+#draw-root #dw-drag button:hover { background: rgba(0, 0, 0, 0.08); }
+
+#draw-root .dw-body { padding: 10px 12px 12px; }
+
+#draw-root .dw-row { margin: 7px 0; }
+
+/* 色板 */
+#draw-root .dw-swatches {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+#draw-root .dw-swatch {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  outline: 1px solid rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.1s;
+}
+#draw-root .dw-swatch:hover { transform: scale(1.18); }
+#draw-root .dw-swatch.active { outline: 2px solid #2f7bff; transform: scale(1.18); }
+#draw-root .dw-custom-color {
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  border-radius: 6px;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+/* 粗细 */
+#draw-root .dw-size-row { display: flex; align-items: center; gap: 8px; }
+#draw-root .dw-size-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: #2f7bff;
+}
+#draw-root .dw-size-value {
+  min-width: 30px;
+  text-align: right;
+  color: #666;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 按钮 */
+#draw-root .dw-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+#draw-root .dw-btns button {
+  flex: 1;
+  min-width: 56px;
+  padding: 6px 8px;
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  color: #333;
+}
+#draw-root .dw-btns button:hover { background: #f6f6f6; }
+#draw-root .dw-btns button.dw-active {
+  background: #e8f0ff;
+  border-color: #2f7bff;
+  color: #2f7bff;
+}
+#draw-root .dw-btns button:active { transform: translateY(1px); }
+
+/* 轻提示 */
+#draw-root .dw-toast {
+  position: fixed;
+  left: 50%;
+  top: 20%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font: 13px system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+  pointer-events: none;
+  z-index: 2147483647;
+  white-space: nowrap;
+  max-width: 80vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

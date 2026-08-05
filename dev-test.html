@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Web Draw 开发测试页</title>
+<style>
+  body { min-height: 2600px; margin: 0; font: 15px/1.7 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; color: #222; }
+  header { position: sticky; top: 0; background: #2f7bff; color: #fff; padding: 12px 24px; font-weight: 600; }
+  main { padding: 16px 24px; max-width: 760px; margin: 0 auto; }
+  .box { border: 1px solid #e0e0e0; border-radius: 8px; padding: 16px 20px; margin: 28px 0; background: #fafafa; }
+  .tall { height: 320px; }
+  li { margin: 6px 0; }
+</style>
+</head>
+<body>
+<header>🖌 Web Draw 开发测试页 —— 不装扩展,直接测绘制引擎</header>
+<main>
+  <p>本页直接加载了 <code>content.css</code> 和 <code>content.js</code>,打开即激活绘制层(相当于已点击扩展图标)。</p>
+  <ul>
+    <li><b>触控笔</b>落下即画(带压感);</li>
+    <li><b>手指触摸 / 鼠标滚轮</b>滚动页面时,草稿应跟随内容一起移动;</li>
+    <li>想用<b>鼠标</b>画 → 点工具栏「🖱 鼠标画」;想鼠标正常划选/点击 → 保持关闭;</li>
+    <li>Esc 退出绘制层;Ctrl+Z 撤销。</li>
+  </ul>
+  <div class="box">段落 1 —— 先在这一段画几笔,然后滚动页面,确认草稿跟着段落走。</div>
+  <div class="box tall">段落 2(较高的段落,方便画长线测试)</div>
+  <div class="box">段落 3</div>
+  <div class="box">段落 4</div>
+</main>
+<script>
+  // 在这里可临时调整初始设置(默认与扩展一致:鼠标不画)
+  window.DW_CONFIG = { drawWithMouse: false };
+</script>
+<link rel="stylesheet" href="content.css">
+<script src="content.js"></script>
+</body>
+</html>
