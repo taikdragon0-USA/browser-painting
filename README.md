@@ -1,5 +1,8 @@
 # Web Draw — 网页绘画扩展
 
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
+[![Releases](https://img.shields.io/github/v/release/taikdragon0-USA/browser-painting)](https://github.com/taikdragon0-USA/browser-painting/releases)
+
 在任意网页之上用**触控笔**画画、涂鸦、标注。草稿锚定在**页面坐标**上,网页上下滚动时,草稿会**跟随网页内容一起移动**,而不是固定在屏幕某个位置。
 
 - 支持 Chrome / Edge(Manifest V3)
@@ -9,6 +12,8 @@
 > [MIT License](LICENSE)
 
 ## 加载到浏览器
+
+> 安装源二选一:① 直接用本仓库源码目录;② 下载 [Releases](https://github.com/taikdragon0-USA/browser-painting/releases) 里的 `browser-painting-vX.Y.Z.zip` 解压。两者都按下面的「加载已解压的扩展程序」选择对应文件夹即可。
 
 ### Chrome
 1. 打开 `chrome://extensions`
