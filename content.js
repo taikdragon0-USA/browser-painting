@@ -52,7 +52,7 @@
     ellipse:    { name: '椭圆',   icon: '◯',  shortcut: 'O', wMin: 1, wMax: 30 },
     select:     { name: '选择',   icon: '↖',  shortcut: 'V', wMin: 1, wMax: 40 },
     text:       { name: '文字',   icon: '🆃', shortcut: 'T', wMin: 10, wMax: 72 },
-    eraser:     { name: '橡皮',   icon: '🧽', shortcut: 'E', wMin: 5, wMax: 60 },
+    eraser:     { name: '橡皮',   icon: '🧽', shortcut: 'E', wMin: 4, wMax: 40 },
   };
   const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', select: '—', text: '字号', eraser: '橡皮大小' };
 
@@ -64,6 +64,7 @@
       pressureExp: 0.7, pressureMin: 0.15,
       autoSave: true, showDrafts: true,
       selectMode: 'lasso',
+      eraserWidth: 10,        // 橡皮独立大小(与画笔粗细解耦)
     },
     window.DW_CONFIG || {}
   );
@@ -469,12 +470,42 @@
   }
 
   // ── 橡皮擦(段级) ───────────────────────────────────────────
-  function eraserRadius() { return Math.max(4, SETTINGS.width / 2); }
+  function eraserRadius() { return SETTINGS.eraserWidth / 2; }
+
+  // 把一段路径按半径膨胀成闭合多边形(橡皮擦的"带状"擦除区域)
+  function inflatePath(path, radius) {
+    if (path.length < 2) return null;
+    const left = [], right = [];
+    for (let i = 0; i < path.length; i++) {
+      const prev = path[Math.max(0, i - 1)];
+      const next = path[Math.min(path.length - 1, i + 1)];
+      const dx = next.x - prev.x, dy = next.y - prev.y;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      const nx = (-dy / len) * radius, ny = (dx / len) * radius;
+      left.push({ x: path[i].x + nx, y: path[i].y + ny });
+      right.push({ x: path[i].x - nx, y: path[i].y - ny });
+    }
+    return left.concat(right.reverse());
+  }
+  // 单点橡皮:点周围画一个圆多边形
+  function circlePolygon(c, r, n) {
+    n = n || 12;
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      pts.push({ x: c.x + Math.cos(a) * r, y: c.y + Math.sin(a) * r });
+    }
+    return pts;
+  }
 
   // 对 Store.strokes 应用擦除,返回 {strokes, changed}
+  // 笔刷用"带状区域裁剪"(线段级精确):只有真正落在橡皮扫过范围内的部分被擦掉,
+  // 稀疏笔画/直线图形不会被"一靠近就整条删"。
   function eraseStrokes(strokes, path, radius) {
     if (!path.length) return { strokes: strokes, changed: false };
     const erBBox = bboxOfPoints(path);
+    erBBox.minX -= radius; erBBox.minY -= radius;
+    erBBox.maxX += radius; erBBox.maxY += radius;
     const out = [];
     let changed = false;
 
@@ -488,12 +519,22 @@
         continue;
       }
 
-      // 图形:关键点命中即整条删除
+      // 直线/箭头:按带状裁剪(线段级,擦过中部也能断)
+      if (tool === 'line' || tool === 'arrow') {
+        const ribbon = path.length === 1 ? circlePolygon(path[0], radius) : inflatePath(path, radius);
+        if (!ribbon) { out.push(st); continue; }
+        const sp = splitPolyline(st.points, { type: 'poly', pts: ribbon });
+        if (!sp.inside.length) { out.push(st); continue; }
+        changed = true;
+        for (const run of sp.outside) {
+          if (run.length) out.push(makeSubStroke(st, run));
+        }
+        continue;
+      }
+      // 矩形/椭圆:关键点命中即整条删除
       if (IS_SHAPE(tool)) {
         const a = st.points[0], b = st.points[st.points.length - 1];
-        const keyPts = (tool === 'line' || tool === 'arrow')
-          ? [a, b]
-          : [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }];
+        const keyPts = [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }];
         let hit = false;
         for (const p of keyPts) { if (distToPath(p, path) <= radius) { hit = true; break; } }
         if (hit) { changed = true; continue; }
@@ -501,32 +542,17 @@
         continue;
       }
 
-      // 笔刷:bbox 粗筛
+      // 笔刷:bbox 粗筛后,用橡皮膨胀出的带状多边形做线段级裁剪
       const stBBox = bboxOfPoints(st.points);
       if (!bboxIntersects(stBBox, erBBox)) { out.push(st); continue; }
-
-      // 逐点判定:点距橡皮路径 < r,或橡皮点落在某线段附近
-      const hits = new Array(st.points.length).fill(false);
-      for (let i = 0; i < st.points.length; i++) {
-        if (distToPath(st.points[i], path) <= radius) hits[i] = true;
-      }
-      for (const ep of path) {
-        for (let i = 0; i < st.points.length - 1; i++) {
-          if (distPointToSegment(ep, st.points[i], st.points[i + 1]) <= radius) { hits[i] = true; hits[i + 1] = true; }
-        }
-      }
-      if (!hits.some(Boolean)) { out.push(st); continue; }
-      if (hits.every(Boolean)) { changed = true; continue; }   // 整条被擦
+      const ribbon = path.length === 1 ? circlePolygon(path[0], radius) : inflatePath(path, radius);
+      if (!ribbon) { out.push(st); continue; }
+      const sp = splitPolyline(st.points, { type: 'poly', pts: ribbon });
+      if (!sp.inside.length) { out.push(st); continue; }   // 没被擦到
       changed = true;
-      let run = [];
-      for (let i = 0; i < st.points.length; i++) {
-        if (!hits[i]) run.push(st.points[i]);
-        else if (run.length) {
-          out.push(makeSubStroke(st, run));
-          run = [];
-        }
+      for (const run of sp.outside) {
+        if (run.length) out.push(makeSubStroke(st, run));
       }
-      if (run.length) out.push(makeSubStroke(st, run));
     }
     return { strokes: out, changed: changed };
   }
@@ -1272,10 +1298,12 @@
     },
 
     deleteSelected() {
+      if (!this.selectedFragments.length) return;   // 没有可删的
       const before = Store.strokes;
       let after;
       if (this.remainderBySrc.size) {
         // 未移动:源笔画仍在 Store,删除 = 只保留区域外片段
+        // (笔画数量可能不变,但内容确实变了 —— 不能用数量判断"有没有删")
         const ids = this.affectedIds;
         after = [];
         for (const s of before) {
@@ -1285,9 +1313,9 @@
       } else {
         // 已移动:被选片段已在 Store,直接按 id 过滤
         const ids = new Set(this.selectedFragments.map((f) => f.id));
+        if (!ids.size) return;
         after = before.filter((s) => !ids.has(s.id));
       }
-      if (after.length === before.length) return;
       Store.commitChange(before, after);
       Renderer.redrawStatic();
       this.clear();
@@ -1471,8 +1499,10 @@
       this._buildSwatches();
 
       this._els.size.addEventListener('input', () => {
-        SETTINGS.width = parseInt(this._els.size.value, 10);
-        this._els.sizeValue.textContent = SETTINGS.width;
+        const v = parseInt(this._els.size.value, 10);
+        if (SETTINGS.tool === 'eraser') SETTINGS.eraserWidth = v;
+        else SETTINGS.width = v;
+        this._els.sizeValue.textContent = v;
       });
       this._els.opacity.addEventListener('input', () => {
         SETTINGS.opacity = parseInt(this._els.opacity.value, 10) / 100;
@@ -1599,12 +1629,18 @@
       this._els.tools.querySelectorAll('.dw-tool').forEach((b) => {
         b.classList.toggle('dw-active', b.dataset.tool === SETTINGS.tool);
       });
-      // 粗细滑杆范围/标签
+      // 粗细滑杆范围/标签(橡皮独立大小,与画笔粗细解耦)
       this._els.size.min = def.wMin;
       this._els.size.max = def.wMax;
-      SETTINGS.width = clamp(SETTINGS.width, def.wMin, def.wMax);
-      this._els.size.value = SETTINGS.width;
-      this._els.sizeValue.textContent = SETTINGS.width;
+      if (SETTINGS.tool === 'eraser') {
+        SETTINGS.eraserWidth = clamp(SETTINGS.eraserWidth, def.wMin, def.wMax);
+        this._els.size.value = SETTINGS.eraserWidth;
+        this._els.sizeValue.textContent = SETTINGS.eraserWidth;
+      } else {
+        SETTINGS.width = clamp(SETTINGS.width, def.wMin, def.wMax);
+        this._els.size.value = SETTINGS.width;
+        this._els.sizeValue.textContent = SETTINGS.width;
+      }
       this._els.sizeLabel.textContent = SIZE_LABELS[SETTINGS.tool];
       // 透明度
       this._els.opacity.value = Math.round(SETTINGS.opacity * 100);
@@ -1792,6 +1828,13 @@
       }
     },
 
+    // 按当前工具调整尺寸(橡皮调橡皮大小,其余调线宽/字号)
+    adjustSize(delta) {
+      const def = TOOL_DEFS[SETTINGS.tool];
+      if (SETTINGS.tool === 'eraser') SETTINGS.eraserWidth = clamp(SETTINGS.eraserWidth + delta, def.wMin, def.wMax);
+      else SETTINGS.width = clamp(SETTINGS.width + delta, def.wMin, def.wMax);
+    },
+
     toggleHide() {
       Editor.commit();
       SETTINGS.showDrafts = !SETTINGS.showDrafts;
@@ -1841,8 +1884,8 @@
       else if (e.key === 'o' || e.key === 'O') this.selectTool('ellipse');
       else if (e.key === 'h' || e.key === 'H') this.toggleHide();
       else if (e.key === '?') { e.preventDefault(); Toolbar.toggleHelp(); }
-      else if (e.key === '[') { SETTINGS.width = clamp(SETTINGS.width - 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
-      else if (e.key === ']') { SETTINGS.width = clamp(SETTINGS.width + 2, TOOL_DEFS[SETTINGS.tool].wMin, TOOL_DEFS[SETTINGS.tool].wMax); Toolbar.sync(); }
+      else if (e.key === '[') { this.adjustSize(-2); Toolbar.sync(); }
+      else if (e.key === ']') { this.adjustSize(2); Toolbar.sync(); }
     },
   };
 

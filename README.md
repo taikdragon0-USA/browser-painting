@@ -1,6 +1,6 @@
 # Web Draw — 网页绘画扩展
 
-![Version](https://img.shields.io/badge/version-0.5.0-blue)
+![Version](https://img.shields.io/badge/version-0.5.1-blue)
 [![Releases](https://img.shields.io/github/v/release/taikdragon0-USA/browser-painting)](https://github.com/taikdragon0-USA/browser-painting/releases)
 
 在任意网页之上用**触控笔**画画、标注、涂鸦。草稿锚定在**页面坐标**上,网页上下滚动时,草稿会**跟随网页内容一起移动**,而不是固定在屏幕某个位置。
@@ -37,7 +37,7 @@
 | 手指 / 滚轮 | 正常滚动网页,草稿跟随内容移动 |
 | 工具格 | 选择 / 钢笔 / 马克笔 / 荧光笔 / 铅笔 / 霓虹 / 直线 / 箭头 / 矩形 / 椭圆 / 文字 / 橡皮 |
 | 选择 / V | **框选或套索**圈选草稿(工具栏可切换)→ 框内拖动**移动**,Delete 删除,Esc 取消;**只选中区域内的片段**,选中的草稿带**蓝色发光高光** |
-| 橡皮 | **局部擦除** —— 擦到哪、笔迹断到哪(撤销可回退) |
+| 橡皮 | **局部擦除** —— 擦到哪、笔迹断到哪(撤销可回退);**大小独立可调**,不继承画笔粗细 |
 | 文字 | 点一下出输入框,回车提交;Shift+回车换行;Esc 取消 |
 | 色板 / 自定义色 | 切换颜色 |
 | 粗细滑杆 | 按工具自动切换语义:粗细 / 线宽 / 字号 / 橡皮大小 |
