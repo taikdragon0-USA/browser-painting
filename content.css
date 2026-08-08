@@ -1,5 +1,5 @@
 /* ============================================================
-   Web Draw — content styles (v0.3.0)
+   Web Draw — content styles (v1.0.0)
    全部以 #draw-root 为作用域前缀,避免污染宿主页面。
    html[data-dw-lock] 是触控笔笔画进行时的整页滚动锁。
    ============================================================ */
@@ -220,6 +220,22 @@ html[data-dw-lock] {
   border-color: #2f7bff;
   color: #2f7bff;
 }
+
+/* 贴纸选择行 */
+#draw-root .dw-stamp-row { display: none; align-items: center; gap: 4px; flex-wrap: wrap; }
+#draw-root .dw-stamp {
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+  line-height: 1;
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  padding: 0;
+}
+#draw-root .dw-stamp:hover { background: #f6f6f6; }
+#draw-root .dw-stamp.dw-active { border-color: #2f7bff; background: #e8f0ff; }
 
 /* 快捷键面板 */
 #draw-root #dw-shortcuts {

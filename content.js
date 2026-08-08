@@ -1,5 +1,5 @@
 // ============================================================
-// Web Draw — 网页绘画 content script (v0.3.0)
+// Web Draw — 网页绘画 content script (v1.0.0)
 // 在任意网页之上画画/标注:五种笔刷、图形、文字、橡皮擦、自动保存、导出截图。
 // 草稿锚定在"页面坐标",静态画布在文档流中随网页原生滚动 → 滚动零错位。
 //
@@ -23,6 +23,7 @@
   const MAX_POINTS = 5000;
   const MIN_DIST = 1.2;
   const MAX_HISTORY = 100;
+  const RAINBOW_DEG_PER_PX = 0.6;   // 彩虹:每像素色相进速(度/px),~600px 转满一圈
   const SWATCHES = ['#ff3b30', '#ffa400', '#ffe10a', '#1fcecb', '#2f7bff', '#1c1c1c'];
   const SHORTCUT_LIST = [
     ['V', '框选(套索/矩形)'], ['B', '循环切换笔刷'], ['E', '橡皮'], ['T', '文字'],
@@ -34,9 +35,9 @@
   const MAX_CANVAS_DIM = 32767;
 
   // 工具分组
-  const BRUSH_TOOLS = ['pen', 'marker', 'highlighter', 'pencil', 'neon'];
+  const BRUSH_TOOLS = ['pen', 'marker', 'highlighter', 'pencil', 'neon', 'rainbow'];
   const SHAPE_TOOLS = ['line', 'arrow', 'rect', 'ellipse'];
-  const TOOL_ORDER = ['select', ...BRUSH_TOOLS, ...SHAPE_TOOLS, 'text', 'eraser'];
+  const TOOL_ORDER = ['select', ...BRUSH_TOOLS, ...SHAPE_TOOLS, 'text', 'eraser', 'stamp'];
   const IS_BRUSH = (t) => BRUSH_TOOLS.includes(t);
   const IS_SHAPE = (t) => SHAPE_TOOLS.includes(t);
 
@@ -46,6 +47,7 @@
     highlighter:{ name: '荧光笔', icon: '🖍️', shortcut: '',  wMin: 5, wMax: 80 },
     pencil:     { name: '铅笔',   icon: '✏️', shortcut: '',  wMin: 1, wMax: 40 },
     neon:       { name: '霓虹',   icon: '⚡',  shortcut: '',  wMin: 1, wMax: 40 },
+    rainbow:    { name: '彩虹',   icon: '🌈', shortcut: '',  wMin: 1, wMax: 40 },
     line:       { name: '直线',   icon: '╱',  shortcut: 'L', wMin: 1, wMax: 30 },
     arrow:      { name: '箭头',   icon: '➡️', shortcut: 'A', wMin: 1, wMax: 30 },
     rect:       { name: '矩形',   icon: '▭',  shortcut: 'R', wMin: 1, wMax: 30 },
@@ -53,8 +55,9 @@
     select:     { name: '选择',   icon: '↖',  shortcut: 'V', wMin: 1, wMax: 40 },
     text:       { name: '文字',   icon: '🆃', shortcut: 'T', wMin: 10, wMax: 72 },
     eraser:     { name: '橡皮',   icon: '🧽', shortcut: 'E', wMin: 4, wMax: 40 },
+    stamp:      { name: '贴纸',   icon: '🏷️', shortcut: '',  wMin: 12, wMax: 96 },
   };
-  const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', select: '—', text: '字号', eraser: '橡皮大小' };
+  const SIZE_LABELS = { pen: '粗细', marker: '粗细', highlighter: '粗细', pencil: '粗细', neon: '粗细', rainbow: '粗细', line: '线宽', arrow: '线宽', rect: '线宽', ellipse: '线宽', select: '—', text: '字号', eraser: '橡皮大小', stamp: '大小' };
 
   // 可通过 window.DW_CONFIG 覆盖(dev-test.html 用)
   const SETTINGS = Object.assign(
@@ -65,6 +68,7 @@
       autoSave: true, showDrafts: true,
       selectMode: 'lasso',
       eraserWidth: 10,        // 橡皮独立大小(与画笔粗细解耦)
+      stampEmoji: '⭐',
     },
     window.DW_CONFIG || {}
   );
@@ -128,7 +132,13 @@
   }
 
   function pointInRect(p, r) {
-    return p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1;
+    // 兼容两套字段名:region.r 用 {x0,y0,x1,y1};fragmentsBBox/erBBox 用 {minX,minY,maxX,maxY}
+    const x0 = r.x0 !== undefined ? r.x0 : r.minX;
+    const x1 = r.x1 !== undefined ? r.x1 : r.maxX;
+    const y0 = r.y0 !== undefined ? r.y0 : r.minY;
+    const y1 = r.y1 !== undefined ? r.y1 : r.maxY;
+    return p.x >= Math.min(x0, x1) && p.x <= Math.max(x0, x1) &&
+           p.y >= Math.min(y0, y1) && p.y <= Math.max(y0, y1);
   }
   function segsIntersect(p1, p2, p3, p4) {
     const o1 = (p2.x - p1.x) * (p3.y - p1.y) - (p2.y - p1.y) * (p3.x - p1.x);
@@ -153,6 +163,12 @@
       const w = String(stroke.text || '').length * stroke.fontSize * 0.6;
       const h = stroke.fontSize;
       return [{ x: p.x, y: p.y }, { x: p.x + w, y: p.y }, { x: p.x + w, y: p.y + h }, { x: p.x, y: p.y + h }];
+    }
+    if (tool === 'stamp') {
+      const p = stroke.points[0];
+      const s = Math.max(1, Math.min(stroke.size || SETTINGS.width || 24, 512));
+      const h = s / 2;
+      return [p, { x: p.x - h, y: p.y - h }, { x: p.x + h, y: p.y - h }, { x: p.x + h, y: p.y + h }, { x: p.x - h, y: p.y + h }];
     }
     if (IS_SHAPE(tool)) {
       const a = stroke.points[0], b = stroke.points[stroke.points.length - 1];
@@ -280,13 +296,22 @@
       }
       if (cursor < 1) emit(false, lerp(a, b, cursor));
     }
+    // 修复:循环只到 points.length-2。最后一段整段在区域外、或以区域外收尾时,
+    // 终点 lastPt 不会出现在任何 emit 中 → 补一次(emit 内部做 run 切换与去重)。
+    if (points.length >= 2) {
+      const lastPt = points[points.length - 1];
+      const curLast = curRun && curRun.length ? curRun[curRun.length - 1] : null;
+      if (!curLast || Math.abs(curLast.x - lastPt.x) + Math.abs(curLast.y - lastPt.y) > 0.01) {
+        emit(pointInRegion(lastPt, region), lastPt);
+      }
+    }
     flush();
     return { inside: runsIn, outside: runsOut };
   }
   // 一笔 → "选内片段" 与 "选外片段"
   function fragmentsForStroke(stroke, region) {
     const tool = stroke.tool || 'pen';
-    if (tool === 'text' || tool === 'rect' || tool === 'ellipse') {
+    if (tool === 'text' || tool === 'rect' || tool === 'ellipse' || tool === 'stamp') {
       const hit = strokeHitPoints(stroke).some((p) => pointInRegion(p, region));
       const whole = Object.assign({}, stroke, { srcId: stroke.id, id: ++Input._uid, points: stroke.points.slice() });
       return hit ? { inside: [whole], outside: [] } : { inside: [], outside: [whole] };
@@ -384,13 +409,18 @@
   function drawPolyline(ctx, pts, stroke, mult, alphaMult) {
     const outer = ctx.globalAlpha;
     ctx.globalAlpha = outer * alphaMult;
+    const isRainbow = (stroke.tool || '') === 'rainbow';
+    const hueBase = isRainbow && typeof stroke.hue === 'number' ? stroke.hue : 0;
+    let dist = 0;   // 自笔画起点的累计弧长 → 色相稳定(重绘/滚动/导出一致)
     for (let i = 1; i < pts.length; i++) {
       const a = pts[i - 1], b = pts[i];
+      if (isRainbow) ctx.strokeStyle = 'hsl(' + ((hueBase + dist * RAINBOW_DEG_PER_PX) % 360) + ', 100%, 55%)';
       ctx.lineWidth = (brushWidthFor(stroke, a) + brushWidthFor(stroke, b)) / 2 * mult;
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
+      dist += Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y));
     }
     ctx.globalAlpha = outer;
   }
@@ -415,6 +445,22 @@
         const lines = String(stroke.text).split('\n');
         const lh = stroke.fontSize * 1.3;
         lines.forEach((ln, i) => ctx.fillText(ln, pt.x, pt.y + stroke.fontSize + i * lh));
+      }
+      ctx.restore();
+      return;
+    }
+
+    // 贴纸印章
+    if (tool === 'stamp') {
+      const pt = stroke.points && stroke.points[0];
+      if (pt && stroke.emoji) {
+        const size = Math.max(1, Math.min(stroke.size || SETTINGS.width || 24, 512));
+        ctx.font = size + 'px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.translate(pt.x, pt.y);
+        ctx.rotate(stroke.rotation || 0);
+        ctx.fillText(stroke.emoji, 0, 0);
       }
       ctx.restore();
       return;
@@ -453,6 +499,7 @@
     ctx.lineCap = (tool === 'marker' || tool === 'highlighter') ? 'butt' : 'round';
     if (smoothed.length === 1) {
       const r = brushWidthFor(stroke, smoothed[0]) / 2;
+      if (tool === 'rainbow') ctx.fillStyle = 'hsl(' + (typeof stroke.hue === 'number' ? stroke.hue : 0) + ', 100%, 55%)';
       ctx.beginPath();
       ctx.arc(smoothed[0].x, smoothed[0].y, r, 0, Math.PI * 2);
       ctx.fill();
@@ -512,9 +559,12 @@
     for (const st of strokes) {
       const tool = st.tool || 'pen';
 
-      // 文字:锚点命中即整条删除
-      if (tool === 'text') {
-        if (distToPath(st.points[0], path) <= radius) { changed = true; continue; }
+      // 文字/贴纸:命中点即整条删除(贴纸按包围盒判,好擦)
+      if (tool === 'text' || tool === 'stamp') {
+        const hitPts = tool === 'stamp' ? strokeHitPoints(st) : [st.points[0]];
+        let hit = false;
+        for (const p of hitPts) { if (distToPath(p, path) <= radius) { hit = true; break; } }
+        if (hit) { changed = true; continue; }
         out.push(st);
         continue;
       }
@@ -780,6 +830,23 @@
         if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.unlockPen();
         return;
       }
+      if (tool === 'stamp') {
+        // 点一下盖一个;不登记 activePointers → 拖动不连盖
+        if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.lockPen();
+        const pt = Coord.toPage(e);
+        Renderer.commitStroke({
+          id: ++this._uid,
+          tool: 'stamp',
+          emoji: SETTINGS.stampEmoji,
+          size: clamp(SETTINGS.width, TOOL_DEFS.stamp.wMin, TOOL_DEFS.stamp.wMax),
+          rotation: (Math.random() * 30 - 15) * Math.PI / 180,   // ±15°
+          opacity: SETTINGS.opacity,
+          pointerType: e.pointerType,
+          points: [{ x: pt.x, y: pt.y, p: 1, tilt: [0, 0] }],
+        });
+        if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.unlockPen();
+        return;
+      }
       if (e.pointerType === 'pen' || e.pointerType === 'eraser') this.lockPen();
 
       if (tool === 'select') {
@@ -809,6 +876,7 @@
         pointerType: e.pointerType,
         points: [pointFromEvent(e)],
       };
+      if (tool === 'rainbow') st.hue = Math.random() * 360;    // 每笔起点随机,存进数据,重绘稳定
       if (IS_SHAPE(tool)) st.points.push(pointFromEvent(e));   // 图形第二点,后续 move 覆盖
       this.activePointers.set(e.pointerId, st);
       Renderer.requestLive();
@@ -1213,8 +1281,11 @@
     onMove(page) {
       if (this.mode === 'marquee' && this.region) {
         if (this.region.type === 'rect') {
-          this.region.r.x1 = page.x;
-          this.region.r.y1 = page.y;
+          const r = this.region.r;
+          r.x1 = page.x;
+          r.y1 = page.y;
+          if (r.x1 < r.x0) { const t = r.x0; r.x0 = r.x1; r.x1 = t; }
+          if (r.y1 < r.y0) { const t = r.y0; r.y0 = r.y1; r.y1 = t; }
         } else {
           const pts = this.region.pts;
           const last = pts[pts.length - 1];
@@ -1397,8 +1468,8 @@
   // 选中片段的高光(蓝色发光描边)
   function drawFragmentHighlight(ctx, f, delta) {
     ctx.save();
-    ctx.shadowColor = '#4da3ff';
-    ctx.shadowBlur = 12;
+    ctx.shadowColor = 'rgba(77,163,255,0.75)';
+    ctx.shadowBlur = 6;
     if (delta) {
       drawStroke(ctx, Object.assign({}, f, {
         points: f.points.map((p) => ({ x: p.x + delta.x, y: p.y + delta.y, p: p.p, tilt: p.tilt })),
@@ -1434,6 +1505,11 @@
           '<div class="dw-sec dw-selmode-row" id="dw-selmode-row">' +
             '<button id="dw-selmode-rect" title="矩形框选">▭ 框选</button>' +
             '<button id="dw-selmode-lasso" title="不规则套索(自由圈选)">⤫ 套索</button>' +
+          '</div>' +
+          '<div class="dw-sec dw-stamp-row" id="dw-stamp-row">' +
+            ['⭐', '❤️', '😄', '🔥', '🎉', '✏️', '🌈'].map((e) =>
+              '<button class="dw-stamp" data-emoji="' + e + '" title="贴纸 ' + e + '">' + e + '</button>'
+            ).join('') +
           '</div>' +
           '<div class="dw-sec dw-styles">' +
             '<div class="dw-row dw-swatches"></div>' +
@@ -1539,6 +1615,15 @@
       this.el.querySelector('#dw-selmode-lasso').addEventListener('click', (e) => {
         e.stopPropagation();
         SETTINGS.selectMode = 'lasso';
+        this.sync();
+      });
+      const stampRow = this.el.querySelector('#dw-stamp-row');
+      stampRow.addEventListener('pointerdown', (e) => e.stopPropagation());
+      stampRow.addEventListener('click', (e) => {
+        const b = e.target.closest('.dw-stamp');
+        if (!b) return;
+        e.stopPropagation();
+        SETTINGS.stampEmoji = b.dataset.emoji;
         this.sync();
       });
       this.el.querySelector('#dw-min').addEventListener('click', (e) => {
@@ -1664,6 +1749,12 @@
         selRow.style.display = SETTINGS.tool === 'select' ? 'flex' : 'none';
         this.el.querySelector('#dw-selmode-rect').classList.toggle('dw-active', SETTINGS.selectMode === 'rect');
         this.el.querySelector('#dw-selmode-lasso').classList.toggle('dw-active', SETTINGS.selectMode === 'lasso');
+      }
+      // 贴纸选择行(仅贴纸工具激活时显示)
+      const stampRow = this.el.querySelector('#dw-stamp-row');
+      if (stampRow) {
+        stampRow.style.display = SETTINGS.tool === 'stamp' ? 'flex' : 'none';
+        stampRow.querySelectorAll('.dw-stamp').forEach((b) => b.classList.toggle('dw-active', b.dataset.emoji === SETTINGS.stampEmoji));
       }
       this.setColor(SETTINGS.color);
     },
